@@ -35,6 +35,7 @@ CREATE TABLE records (
 
 -- CREATE INDEX nametype_index ON records(name,type);
 CREATE INDEX domain_id ON records(domain_id);
+CREATE INDEX records_name ON records(name);
 CREATE INDEX ordername ON records (ordername);
 
 
