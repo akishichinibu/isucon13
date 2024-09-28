@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/allegro/bigcache/v3"
 	"github.com/google/uuid"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
@@ -29,6 +31,22 @@ const (
 )
 
 var fallbackImage = "../img/NoImage.jpg"
+
+var fallbackImageData []byte
+
+var imageCache *bigcache.BigCache
+
+func init() {
+	var err error
+	fallbackImageData, err = os.ReadFile(fallbackImage)
+	if err != nil {
+		panic(err)
+	}
+	imageCache, err = bigcache.New(context.Background(), bigcache.DefaultConfig(1000*time.Minute))
+	if err != nil {
+		panic(err)
+	}
+}
 
 type UserModel struct {
 	ID             int64  `db:"id"`
@@ -85,6 +103,30 @@ type PostIconResponse struct {
 	ID int64 `json:"id"`
 }
 
+func dumpImage(data []byte) (string, error) {
+	hash := md5.Sum(data)
+	ID := fmt.Sprintf("%x", hash)
+	// fn := fmt.Sprintf("../img/%s.jpg", ID)
+	_, err := imageCache.Get(ID)
+	if err == nil {
+		return ID, nil
+	}
+	// if _, err := os.Stat(fn); err == nil {
+	// 	return ID, nil
+	// }
+	err = imageCache.Set(ID, data)
+	return ID, err
+}
+
+func loadIcon(ID string) ([]byte, error) {
+	// fn := fmt.Sprintf("../img/%s.jpg", ID)
+	data, err := imageCache.Get(ID)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
 func getIconHandler(c echo.Context) error {
 	ctx := c.Request().Context()
 
@@ -104,13 +146,18 @@ func getIconHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user: "+err.Error())
 	}
 
-	var image []byte
-	if err := tx.GetContext(ctx, &image, "SELECT image FROM icons WHERE user_id = ?", user.ID); err != nil {
+	var imageID string
+	if err := tx.GetContext(ctx, &imageID, "SELECT image_external_id FROM icons WHERE user_id = ?", user.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return c.File(fallbackImage)
 		} else {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user icon: "+err.Error())
 		}
+	}
+
+	image, err := loadIcon(imageID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to read image: "+err.Error())
 	}
 
 	return c.Blob(http.StatusOK, "image/jpeg", image)
@@ -144,7 +191,12 @@ func postIconHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to delete old user icon: "+err.Error())
 	}
 
-	rs, err := tx.ExecContext(ctx, "INSERT INTO icons (user_id, image) VALUES (?, ?)", userID, req.Image)
+	imageID, err := dumpImage(req.Image)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to dump image: "+err.Error())
+	}
+
+	rs, err := tx.ExecContext(ctx, "INSERT INTO icons (user_id, image_external_id) VALUES (?, ?)", userID, imageID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to insert new user icon: "+err.Error())
 	}
@@ -404,15 +456,18 @@ func fillUserResponse(ctx context.Context, tx *sqlx.Tx, userModel UserModel) (Us
 		return User{}, err
 	}
 
+	var imageID string
 	var image []byte
-	if err := tx.GetContext(ctx, &image, "SELECT image FROM icons WHERE user_id = ?", userModel.ID); err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			return User{}, err
-		}
-		image, err = os.ReadFile(fallbackImage)
+	if err := tx.GetContext(ctx, &imageID, "SELECT image_external_id FROM icons WHERE user_id = ?", userModel.ID); err == nil {
+		image, err = loadIcon(imageID)
 		if err != nil {
 			return User{}, err
 		}
+	} else {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return User{}, err
+		}
+		image = fallbackImageData
 	}
 	iconHash := sha256.Sum256(image)
 

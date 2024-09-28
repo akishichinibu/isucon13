@@ -2,7 +2,7 @@
   "name": "vite-project",
   "private": true,
   "version": "0.0.0",
-  "packageManager": "yarn@3.2.2",
+  "packageManager": "yarn@3.2.2+sha512.15bb87fe7c77cb6f177c82458a31d0e25b3e979d8b2a6552602787273b6e8a492fc7c0e9cf66507dcf3e5e90aefe43776a8bd2ead5577320f36571a329e33e55",
   "type": "module",
   "scripts": {
     "dev": "vite",
