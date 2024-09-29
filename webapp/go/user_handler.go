@@ -2,15 +2,11 @@ package main
 
 import (
 	"context"
-	"crypto/md5"
-	"crypto/sha256"
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"os/exec"
+	"strconv"
 	"time"
 
 	"github.com/allegro/bigcache/v3"
@@ -20,6 +16,7 @@ import (
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -30,23 +27,25 @@ const (
 	bcryptDefaultCost        = bcrypt.MinCost
 )
 
-var fallbackImage = "../img/NoImage.jpg"
-
-var fallbackImageData []byte
-
-var imageCache *bigcache.BigCache
-
 func init() {
 	var err error
-	fallbackImageData, err = os.ReadFile(fallbackImage)
+	userIDToUser, err = bigcache.New(context.Background(), bigcache.DefaultConfig(0))
 	if err != nil {
 		panic(err)
 	}
-	imageCache, err = bigcache.New(context.Background(), bigcache.DefaultConfig(1000*time.Minute))
+	userNameToID, err = bigcache.New(context.Background(), bigcache.DefaultConfig(0))
+	if err != nil {
+		panic(err)
+	}
+	userIDToIconExternalID, err = bigcache.New(context.Background(), bigcache.DefaultConfig(0))
 	if err != nil {
 		panic(err)
 	}
 }
+
+var userIDToUser *bigcache.BigCache
+var userNameToID *bigcache.BigCache
+var userIDToIconExternalID *bigcache.BigCache
 
 type UserModel struct {
 	ID             int64  `db:"id"`
@@ -103,28 +102,91 @@ type PostIconResponse struct {
 	ID int64 `json:"id"`
 }
 
-func dumpImage(data []byte) (string, error) {
-	hash := md5.Sum(data)
-	ID := fmt.Sprintf("%x", hash)
-	// fn := fmt.Sprintf("../img/%s.jpg", ID)
-	_, err := imageCache.Get(ID)
-	if err == nil {
-		return ID, nil
+func getUserByID(ctx context.Context, tx *sqlx.Tx, userID int64) (UserModel, error) {
+	userIDKey := fmt.Sprintf("%d", userID)
+	userBytes, err := userIDToUser.Get(userIDKey)
+
+	var user UserModel
+	if err != nil {
+		if tx == nil {
+			return user, fmt.Errorf("transaction is nil")
+		}
+
+		if err := tx.GetContext(ctx, &user, "SELECT * FROM users WHERE id = ?", userID); err != nil {
+			return user, fmt.Errorf("failed to get user: %w", err)
+		}
+
+		userBytes, err = json.Marshal(user)
+		if err != nil {
+			return user, fmt.Errorf("failed to marshal user: %w", err)
+		}
+
+		if err := userIDToUser.Set(userIDKey, userBytes); err != nil {
+			return user, fmt.Errorf("failed to set user: %w", err)
+		}
+
+		return user, nil
 	}
-	// if _, err := os.Stat(fn); err == nil {
-	// 	return ID, nil
-	// }
-	err = imageCache.Set(ID, data)
-	return ID, err
+
+	if err := json.Unmarshal(userBytes, &user); err != nil {
+		return user, fmt.Errorf("failed to unmarshal user: %w", err)
+	}
+	return user, nil
 }
 
-func loadIcon(ID string) ([]byte, error) {
-	// fn := fmt.Sprintf("../img/%s.jpg", ID)
-	data, err := imageCache.Get(ID)
+func getUserIDByName(ctx context.Context, tx *sqlx.Tx, username string) (int64, error) {
+	userIDBytes, err := userNameToID.Get(username)
 	if err != nil {
-		return nil, err
+		if tx == nil {
+			return 0, fmt.Errorf("transaction is nil")
+		}
+
+		var userID int64
+		if err := tx.GetContext(ctx, &userID, "SELECT id FROM users WHERE name = ?", username); err != nil {
+			return 0, fmt.Errorf("failed to get user id by name: %w", err)
+		}
+
+		if err := userNameToID.Set(username, []byte(fmt.Sprintf("%d", userID))); err != nil {
+			return 0, fmt.Errorf("failed to set user id: %w", err)
+		}
+
+		return userID, nil
 	}
-	return data, nil
+	userID, err := strconv.Atoi(string(userIDBytes))
+	if err != nil {
+		return 0, fmt.Errorf("failed to convert user id to int: %w", err)
+	}
+	return int64(userID), nil
+}
+
+func getIconExternalIDByUserID(ctx context.Context, tx *sqlx.Tx, userID int64) (string, error) {
+	userIDKey := fmt.Sprintf("%d", userID)
+	iconExternalID, err := userIDToIconExternalID.Get(userIDKey)
+	fmt.Printf("try to get icon external id by user id: %d\n", userID)
+	if err != nil {
+		if tx == nil {
+			return "", fmt.Errorf("transaction is nil")
+		}
+
+		var iconExternalID string
+		if err := tx.GetContext(ctx, &iconExternalID, "SELECT image_external_id FROM icons WHERE user_id = ?", userID); err == nil {
+			if err := userIDToIconExternalID.Set(userIDKey, []byte(iconExternalID)); err != nil {
+				return "", fmt.Errorf("failed to set icon external id: %w", err)
+			}
+			return iconExternalID, nil
+		} else {
+			return fallbackImageID, nil
+		}
+	}
+	return string(iconExternalID), nil
+}
+
+func removeIconExternalCache(userID int64) error {
+	userIDKey := fmt.Sprintf("%d", userID)
+	if err := userIDToIconExternalID.Delete(userIDKey); err != nil {
+		return fmt.Errorf("failed to delete icon external id: %w", err)
+	}
+	return nil
 }
 
 func getIconHandler(c echo.Context) error {
@@ -138,24 +200,15 @@ func getIconHandler(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
-	var user UserModel
-	if err := tx.GetContext(ctx, &user, "SELECT * FROM users WHERE name = ?", username); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return echo.NewHTTPError(http.StatusNotFound, "not found user that has the given username")
-		}
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user: "+err.Error())
+	userID, err := getUserIDByName(ctx, tx, username)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "not found user that has the given username")
 	}
-
-	var imageID string
-	if err := tx.GetContext(ctx, &imageID, "SELECT image_external_id FROM icons WHERE user_id = ?", user.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return c.File(fallbackImage)
-		} else {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user icon: "+err.Error())
-		}
+	imageID, err := getIconExternalIDByUserID(ctx, tx, userID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get icon external id: "+err.Error())
 	}
-
-	image, err := loadIcon(imageID)
+	image, err := loadImage(imageID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to read image: "+err.Error())
 	}
@@ -196,6 +249,8 @@ func postIconHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to dump image: "+err.Error())
 	}
 
+	fmt.Printf("the icon of user %d is updated to %s", userID, imageID)
+
 	rs, err := tx.ExecContext(ctx, "INSERT INTO icons (user_id, image_external_id) VALUES (?, ?)", userID, imageID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to insert new user icon: "+err.Error())
@@ -210,6 +265,7 @@ func postIconHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to commit: "+err.Error())
 	}
 
+	_ = removeIconExternalCache(userID)
 	return c.JSON(http.StatusCreated, &PostIconResponse{
 		ID: iconID,
 	})
@@ -234,16 +290,7 @@ func getMeHandler(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
-	userModel := UserModel{}
-	err = tx.GetContext(ctx, &userModel, "SELECT * FROM users WHERE id = ?", userID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return echo.NewHTTPError(http.StatusNotFound, "not found user that has the userid in session")
-	}
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user: "+err.Error())
-	}
-
-	user, err := fillUserResponse(ctx, tx, userModel)
+	user, err := fillUserResponse(ctx, tx, userID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fill user: "+err.Error())
 	}
@@ -308,17 +355,17 @@ func registerHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to insert user theme: "+err.Error())
 	}
 
-	if out, err := exec.Command("pdnsutil", "add-record", "u.isucon.dev", req.Name, "A", "0", powerDNSSubdomainAddress).CombinedOutput(); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, string(out)+": "+err.Error())
-	}
-
-	user, err := fillUserResponse(ctx, tx, userModel)
+	user, err := fillUserResponse(ctx, tx, userID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fill user: "+err.Error())
 	}
 
 	if err := tx.Commit(); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to commit: "+err.Error())
+	}
+
+	if out, err := exec.Command("pdnsutil", "add-record", "u.isucon.dev", req.Name, "A", "0", powerDNSSubdomainAddress).CombinedOutput(); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, string(out)+": "+err.Error())
 	}
 
 	return c.JSON(http.StatusCreated, user)
@@ -341,18 +388,13 @@ func loginHandler(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
-	userModel := UserModel{}
-	// usernameはUNIQUEなので、whereで一意に特定できる
-	err = tx.GetContext(ctx, &userModel, "SELECT * FROM users WHERE name = ?", req.Username)
-	if errors.Is(err, sql.ErrNoRows) {
+	userID, err := getUserIDByName(ctx, tx, req.Username)
+	if err != nil {
 		return echo.NewHTTPError(http.StatusUnauthorized, "invalid username or password")
 	}
+	userModel, err := getUserByID(ctx, tx, userID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user: "+err.Error())
-	}
-
-	if err := tx.Commit(); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to commit: "+err.Error())
 	}
 
 	err = bcrypt.CompareHashAndPassword([]byte(userModel.HashedPassword), []byte(req.Password))
@@ -406,19 +448,14 @@ func getUserHandler(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
-	userModel := UserModel{}
-	if err := tx.GetContext(ctx, &userModel, "SELECT * FROM users WHERE name = ?", username); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return echo.NewHTTPError(http.StatusNotFound, "not found user that has the given username")
-		}
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user: "+err.Error())
+	userID, err := getUserIDByName(ctx, tx, username)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "not found user that has the given username")
 	}
-
-	user, err := fillUserResponse(ctx, tx, userModel)
+	user, err := fillUserResponse(ctx, tx, int64(userID))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fill user: "+err.Error())
 	}
-
 	if err := tx.Commit(); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to commit: "+err.Error())
 	}
@@ -450,37 +487,40 @@ func verifyUserSession(c echo.Context) error {
 	return nil
 }
 
-func fillUserResponse(ctx context.Context, tx *sqlx.Tx, userModel UserModel) (User, error) {
-	themeModel := ThemeModel{}
-	if err := tx.GetContext(ctx, &themeModel, "SELECT * FROM themes WHERE user_id = ?", userModel.ID); err != nil {
+func fillUserResponse(ctx context.Context, tx *sqlx.Tx, userID int64) (User, error) {
+	var userModel UserModel
+	var themeModel ThemeModel
+	var imageID string
+
+	g, _ := errgroup.WithContext(ctx)
+	g.SetLimit(1)
+	g.Go(func() error {
+		var err error
+		userModel, err = getUserByID(ctx, tx, userID)
+		return err
+	})
+	g.Go(func() error {
+		var err error
+		themeModel, err = fetchThemeByUserID(ctx, tx, userID)
+		return err
+	})
+	g.Go(func() error {
+		var err error
+		imageID, err = getIconExternalIDByUserID(ctx, tx, userID)
+		return err
+	})
+
+	if err := g.Wait(); err != nil {
 		return User{}, err
 	}
-
-	var imageID string
-	var image []byte
-	if err := tx.GetContext(ctx, &imageID, "SELECT image_external_id FROM icons WHERE user_id = ?", userModel.ID); err == nil {
-		image, err = loadIcon(imageID)
-		if err != nil {
-			return User{}, err
-		}
-	} else {
-		if !errors.Is(err, sql.ErrNoRows) {
-			return User{}, err
-		}
-		image = fallbackImageData
-	}
-	iconHash := sha256.Sum256(image)
 
 	user := User{
 		ID:          userModel.ID,
 		Name:        userModel.Name,
 		DisplayName: userModel.DisplayName,
 		Description: userModel.Description,
-		Theme: Theme{
-			ID:       themeModel.ID,
-			DarkMode: themeModel.DarkMode,
-		},
-		IconHash: fmt.Sprintf("%x", iconHash),
+		Theme:       Theme{ID: themeModel.UserID, DarkMode: themeModel.DarkMode},
+		IconHash:    imageID,
 	}
 
 	return user, nil
