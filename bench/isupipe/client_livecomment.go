@@ -246,6 +246,7 @@ func (c *Client) PostLivecomment(ctx context.Context, livestreamID int64, stream
 			return nil, 0, err
 		}
 
+		c.contestantLogger.Info(fmt.Sprintf("# add tip: %s %s %s %d\n", streamerName, livecommentResponse.User.Name, comment, tip.Tip))
 		benchscore.AddTip(uint64(tip.Tip))
 	}
 
