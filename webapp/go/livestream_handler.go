@@ -2,18 +2,114 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
+	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/v4"
+	"github.com/samber/lo"
 )
+
+// MARK: cache
+
+var cacheLivestreamIDToLivestream *cache.Cache[int64, LivestreamModel]
+var cacheLivestreamIDToUserID *cache.Cache[int64, int64]
+var cacheUserIDToLivestreams *cache.Cache[int64, []int64]
+var cacheLivestreamIDToTagsIDs *cache.Cache[int64, []int64]
+var cacheTagIDToLivestreams *cache.Cache[int64, []int64]
+
+func init() {
+	cacheLivestreamIDToLivestream = cache.New[int64, LivestreamModel]()
+	cacheLivestreamIDToUserID = cache.New[int64, int64]()
+	cacheUserIDToLivestreams = cache.New[int64, []int64]()
+	cacheLivestreamIDToTagsIDs = cache.New[int64, []int64]()
+	cacheTagIDToLivestreams = cache.New[int64, []int64]()
+}
+
+func getLivestreamByID(ctx context.Context, tx *sqlx.Tx, livestreamID int64) (LivestreamModel, error) {
+	livestream, ok := cacheLivestreamIDToLivestream.Get(livestreamID)
+	if !ok {
+		var livestreamModel LivestreamModel
+		if err := tx.GetContext(ctx, &livestreamModel, "SELECT * FROM livestreams WHERE id = ?", livestreamID); err != nil {
+			return LivestreamModel{}, fmt.Errorf("failed to get livestream: %d %w", livestreamID, err)
+		}
+		cacheLivestreamIDToLivestream.Set(livestreamID, livestreamModel)
+		return livestreamModel, nil
+	}
+	return livestream, nil
+}
+
+func getTagIDsByLivestreamID(ctx context.Context, tx *sqlx.Tx, livestreamID int64) ([]int64, error) {
+	tagIDs, ok := cacheLivestreamIDToTagsIDs.Get(livestreamID)
+	if !ok {
+		var tagIDs []int64
+		if err := tx.SelectContext(ctx, &tagIDs, "SELECT tag_id FROM livestream_tags WHERE livestream_id = ?", livestreamID); err != nil {
+			return nil, fmt.Errorf("failed to get livestream tags: %w", err)
+		}
+		cacheLivestreamIDToTagsIDs.Set(livestreamID, tagIDs)
+		return tagIDs, nil
+	}
+
+	return tagIDs, nil
+}
+
+func getLivesteamTagsByID(ctx context.Context, tx *sqlx.Tx, livestreamID int64) ([]TagModel, error) {
+	tagIDs, err := getTagIDsByLivestreamID(ctx, tx, livestreamID)
+	if err != nil {
+		return nil, err
+	}
+	tags := make([]TagModel, 0)
+	for _, tagID := range tagIDs {
+		tag, err := fetchTagByTagID(ctx, tx, tagID)
+		if err != nil {
+			return nil, err
+		}
+		tags = append(tags, tag)
+	}
+	return tags, nil
+}
+
+func getLivestreamIDsByTagID(ctx context.Context, tx *sqlx.Tx, tagID int64) ([]int64, error) {
+	lids, ok := cacheTagIDToLivestreams.Get(tagID)
+	if !ok {
+		var livestreamIDs []int64
+		if err := tx.SelectContext(ctx, &livestreamIDs, "SELECT livestream_id FROM livestream_tags WHERE tag_id = ?", tagID); err != nil {
+			return nil, fmt.Errorf("failed to get livestream tags: %w", err)
+		}
+		cacheTagIDToLivestreams.Set(tagID, livestreamIDs)
+		return livestreamIDs, nil
+	}
+
+	return lids, nil
+}
+
+func getLivestreamsByUserID(ctx context.Context, tx *sqlx.Tx, userID int64) ([]int64, error) {
+	lids, ok := cacheUserIDToLivestreams.Get(userID)
+	if !ok {
+		var livestreamModels []LivestreamModel
+		if err := tx.SelectContext(ctx, &livestreamModels, "SELECT * FROM livestreams WHERE user_id = ?", userID); err != nil {
+			return nil, fmt.Errorf("failed to get livestreams: %w", err)
+		}
+
+		livestreamIDs := make([]int64, len(livestreamModels))
+		for i, r := range livestreamModels {
+			livestreamIDs[i] = r.ID
+		}
+
+		cacheUserIDToLivestreams.Set(userID, livestreamIDs)
+		return livestreamIDs, nil
+	}
+
+	return lids, nil
+}
+
+// MARK: orignal
 
 type ReserveLivestreamRequest struct {
 	Tags         []int64 `json:"tags"`
@@ -86,12 +182,6 @@ func reserveLivestreamHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "failed to decode the request body as json")
 	}
 
-	tx, err := dbConn.BeginTxx(ctx, nil)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to begin transaction: "+err.Error())
-	}
-	defer tx.Rollback()
-
 	// 2023/11/25 10:00からの１年間の期間内であるかチェック
 	var (
 		termStartAt    = time.Date(2023, 11, 25, 1, 0, 0, 0, time.UTC)
@@ -102,6 +192,12 @@ func reserveLivestreamHandler(c echo.Context) error {
 	if (reserveStartAt.Equal(termEndAt) || reserveStartAt.After(termEndAt)) || (reserveEndAt.Equal(termStartAt) || reserveEndAt.Before(termStartAt)) {
 		return echo.NewHTTPError(http.StatusBadRequest, "bad reservation time range")
 	}
+
+	tx, err := dbConn.BeginTxx(ctx, nil)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to begin transaction: "+err.Error())
+	}
+	defer tx.Rollback()
 
 	// 予約枠をみて、予約が可能か調べる
 	// NOTE: 並列な予約のoverbooking防止にFOR UPDATEが必要
@@ -167,6 +263,12 @@ func reserveLivestreamHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to commit: "+err.Error())
 	}
 
+	// update cache
+	cacheLivestreamIDToLivestream.Delete(livestream.ID)
+	cacheLivestreamIDToUserID.Delete(livestream.ID)
+	cacheUserIDToLivestreams.Delete(int64(userID))
+	cacheLivestreamIDToTagsIDs.Delete(livestream.ID)
+	cacheTagIDToLivestreams.Delete(livestream.ID)
 	return c.JSON(http.StatusCreated, livestream)
 }
 
@@ -187,28 +289,31 @@ func searchLivestreamsHandler(c echo.Context) error {
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch tags: "+err.Error())
 		}
-		tagIDList := make([]int64, len(tags))
-		for i, tag := range tags {
-			tagIDList[i] = tag.ID
-		}
+		fmt.Printf("get tag by name: %s, %+v\n", keyTagName, tags)
 
-		query, params, err := sqlx.In("SELECT * FROM livestream_tags WHERE tag_id IN (?) ORDER BY livestream_id DESC", tagIDList)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to construct IN query: "+err.Error())
+		lids := make([]int64, 0)
+		for _, tag := range tags {
+			livestreamIDs, err := getLivestreamIDsByTagID(ctx, tx, tag.ID)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestreams by tag id: "+err.Error())
+			}
+			for _, lid := range livestreamIDs {
+				lids = append(lids, lid)
+			}
 		}
-		var keyTaggedLivestreams []*LivestreamTagModel
-		if err := tx.SelectContext(ctx, &keyTaggedLivestreams, query, params...); err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to get keyTaggedLivestreams: "+err.Error())
-		}
+		lids = lo.Uniq(lids)
+		slices.Sort(lids)
+		slices.Reverse(lids)
 
-		liveStreamIDs := make([]int64, len(keyTaggedLivestreams))
-		for i, keyTaggedLivestream := range keyTaggedLivestreams {
-			liveStreamIDs[i] = keyTaggedLivestream.LivestreamID
-		}
+		fmt.Printf("get livestreams by tag: %s, %+v\n", keyTagName, lids)
 
-		query, params, err = sqlx.In("SELECT * FROM livestreams WHERE id IN (?) ORDER BY id DESC", liveStreamIDs)
-		if err := tx.SelectContext(ctx, &livestreamModels, query, params...); err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestreams: "+err.Error())
+		for _, lid := range lids {
+			livestreamModel, err := getLivestreamByID(ctx, tx, lid)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestream by id: "+err.Error())
+			}
+
+			livestreamModels = append(livestreamModels, &livestreamModel)
 		}
 	} else {
 		// 検索条件なし
@@ -242,6 +347,7 @@ func searchLivestreamsHandler(c echo.Context) error {
 	return c.JSON(http.StatusOK, livestreams)
 }
 
+// MARK: getMyLivestreamsHandler
 func getMyLivestreamsHandler(c echo.Context) error {
 	ctx := c.Request().Context()
 	if err := verifyUserSession(c); err != nil {
@@ -259,13 +365,18 @@ func getMyLivestreamsHandler(c echo.Context) error {
 	// existence already checked
 	userID := sess.Values[defaultUserIDKey].(int64)
 
-	var livestreamModels []*LivestreamModel
-	if err := tx.SelectContext(ctx, &livestreamModels, "SELECT * FROM livestreams WHERE user_id = ?", userID); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestreams: "+err.Error())
+	lids, err := getLivestreamsByUserID(ctx, tx, userID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestreams by user id: "+err.Error())
 	}
-	livestreams := make([]Livestream, len(livestreamModels))
-	for i := range livestreamModels {
-		livestream, err := fillLivestreamResponse(ctx, tx, *livestreamModels[i])
+
+	livestreams := make([]Livestream, len(lids))
+	for i, lid := range lids {
+		livestreamModel, err := getLivestreamByID(ctx, tx, lid)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestream by id: "+err.Error())
+		}
+		livestream, err := fillLivestreamResponse(ctx, tx, livestreamModel)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to fill livestream: "+err.Error())
 		}
@@ -293,22 +404,23 @@ func getUserLivestreamsHandler(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
-	var user UserModel
-	if err := tx.GetContext(ctx, &user, "SELECT * FROM users WHERE name = ?", username); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return echo.NewHTTPError(http.StatusNotFound, "user not found")
-		} else {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user: "+err.Error())
-		}
+	user, err := getUserByName(ctx, tx, username)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user: "+err.Error())
 	}
 
-	var livestreamModels []*LivestreamModel
-	if err := tx.SelectContext(ctx, &livestreamModels, "SELECT * FROM livestreams WHERE user_id = ?", user.ID); err != nil {
+	lids, err := getLivestreamsByUserID(ctx, tx, user.ID)
+	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestreams: "+err.Error())
 	}
-	livestreams := make([]Livestream, len(livestreamModels))
-	for i := range livestreamModels {
-		livestream, err := fillLivestreamResponse(ctx, tx, *livestreamModels[i])
+
+	livestreams := make([]Livestream, len(lids))
+	for i, lid := range lids {
+		livestreamModel, err := getLivestreamByID(ctx, tx, lid)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestream by id: "+err.Error())
+		}
+		livestream, err := fillLivestreamResponse(ctx, tx, livestreamModel)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to fill livestream: "+err.Error())
 		}
@@ -322,6 +434,7 @@ func getUserLivestreamsHandler(c echo.Context) error {
 	return c.JSON(http.StatusOK, livestreams)
 }
 
+// MARK: enterLivestreamHandler
 // viewerテーブルの廃止
 func enterLivestreamHandler(c echo.Context) error {
 	ctx := c.Request().Context()
@@ -397,6 +510,7 @@ func exitLivestreamHandler(c echo.Context) error {
 	return c.NoContent(http.StatusOK)
 }
 
+// MARK: getLivestreamHandler
 func getLivestreamHandler(c echo.Context) error {
 	ctx := c.Request().Context()
 
@@ -415,13 +529,9 @@ func getLivestreamHandler(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
-	livestreamModel := LivestreamModel{}
-	err = tx.GetContext(ctx, &livestreamModel, "SELECT * FROM livestreams WHERE id = ?", livestreamID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return echo.NewHTTPError(http.StatusNotFound, "not found livestream that has the given id")
-	}
+	livestreamModel, err := getLivestreamByID(ctx, tx, int64(livestreamID))
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestream: "+err.Error())
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestream by id: "+err.Error())
 	}
 
 	livestream, err := fillLivestreamResponse(ctx, tx, livestreamModel)
@@ -436,6 +546,7 @@ func getLivestreamHandler(c echo.Context) error {
 	return c.JSON(http.StatusOK, livestream)
 }
 
+// MARK: getLivecommentReportsHandler
 func getLivecommentReportsHandler(c echo.Context) error {
 	ctx := c.Request().Context()
 
@@ -454,9 +565,9 @@ func getLivecommentReportsHandler(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
-	var livestreamModel LivestreamModel
-	if err := tx.GetContext(ctx, &livestreamModel, "SELECT * FROM livestreams WHERE id = ?", livestreamID); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestream: "+err.Error())
+	livestreamModel, err := getLivestreamByID(ctx, tx, int64(livestreamID))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestream by id: "+err.Error())
 	}
 
 	// error already check
@@ -495,21 +606,17 @@ func fillLivestreamResponse(ctx context.Context, tx *sqlx.Tx, livestreamModel Li
 		return Livestream{}, err
 	}
 
-	var livestreamTagModels []*LivestreamTagModel
-	if err := tx.SelectContext(ctx, &livestreamTagModels, "SELECT * FROM livestream_tags WHERE livestream_id = ?", livestreamModel.ID); err != nil {
-		return Livestream{}, fmt.Errorf("failed to get livestream tags: %w", err)
+	tms, err := getLivesteamTagsByID(ctx, tx, livestreamModel.ID)
+	if err != nil {
+		return Livestream{}, err
 	}
 
-	tags := make([]Tag, len(livestreamTagModels))
-	for i := range livestreamTagModels {
-		t, err := fetchTagsByID(ctx, tx, livestreamTagModels[i].TagID)
-		if err != nil {
-			return Livestream{}, err
+	tags := make([]Tag, len(tms))
+	for i, tm := range tms {
+		tags[i] = Tag{
+			ID:   tm.ID,
+			Name: tm.Name,
 		}
-		if t == nil {
-			return Livestream{}, fmt.Errorf("tag not found: %d", livestreamTagModels[i].TagID)
-		}
-		tags[i] = *t
 	}
 
 	livestream := Livestream{

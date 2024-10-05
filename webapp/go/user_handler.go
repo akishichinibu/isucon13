@@ -4,19 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os/exec"
-	"strconv"
 	"time"
 
-	"github.com/allegro/bigcache/v3"
+	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/google/uuid"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/crypto/bcrypt"
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -27,25 +26,76 @@ const (
 	bcryptDefaultCost        = bcrypt.MinCost
 )
 
+var cacheUserIDToUser *cache.Cache[int64, UserModel]
+var cacheUserNameToID *cache.Cache[string, int64]
+var cacheUserIDToIconExternalID *cache.Cache[int64, string]
+
 func init() {
-	var err error
-	userIDToUser, err = bigcache.New(context.Background(), bigcache.DefaultConfig(0))
-	if err != nil {
-		panic(err)
-	}
-	userNameToID, err = bigcache.New(context.Background(), bigcache.DefaultConfig(0))
-	if err != nil {
-		panic(err)
-	}
-	userIDToIconExternalID, err = bigcache.New(context.Background(), bigcache.DefaultConfig(0))
-	if err != nil {
-		panic(err)
-	}
+	cacheUserIDToUser = cache.New[int64, UserModel]()
+	cacheUserNameToID = cache.New[string, int64]()
+	cacheUserIDToIconExternalID = cache.New[int64, string]()
 }
 
-var userIDToUser *bigcache.BigCache
-var userNameToID *bigcache.BigCache
-var userIDToIconExternalID *bigcache.BigCache
+// MARK: repository
+func getUserByID(ctx context.Context, tx *sqlx.Tx, userID int64) (UserModel, error) {
+	user, ok := cacheUserIDToUser.Get(userID)
+	fmt.Printf("getUserByID: %d %v %v\n", userID, user, ok)
+	if !ok {
+		if tx == nil {
+			return user, fmt.Errorf("transaction is nil")
+		}
+		if err := tx.GetContext(ctx, &user, "SELECT * FROM users WHERE id = ? LIMIT 1", userID); err != nil {
+			return user, fmt.Errorf("failed to get user: %w", err)
+		}
+		cacheUserIDToUser.Set(userID, user)
+		return user, nil
+	}
+	return user, nil
+}
+
+func getUserIDByName(ctx context.Context, tx *sqlx.Tx, username string) (int64, error) {
+	userID, ok := cacheUserNameToID.Get(username)
+	fmt.Printf("getUserIDByName: %s %v %v\n", username, userID, ok)
+	if !ok {
+		if tx == nil {
+			return 0, fmt.Errorf("transaction is nil")
+		}
+		var userID int64
+		if err := tx.GetContext(ctx, &userID, "SELECT id FROM users WHERE name = ?", username); err != nil {
+			return 0, fmt.Errorf("failed to get user id by name: %w", err)
+		}
+		cacheUserNameToID.Set(username, userID)
+		return userID, nil
+	}
+	return userID, nil
+}
+
+func getUserByName(ctx context.Context, tx *sqlx.Tx, username string) (UserModel, error) {
+	userID, err := getUserIDByName(ctx, tx, username)
+	if err != nil {
+		return UserModel{}, err
+	}
+	return getUserByID(ctx, tx, userID)
+}
+
+func getIconExternalIDByUserID(ctx context.Context, tx *sqlx.Tx, userID int64) (string, error) {
+	iconExternalID, ok := cacheUserIDToIconExternalID.Get(userID)
+	if !ok {
+		if tx == nil {
+			return "", fmt.Errorf("transaction is nil")
+		}
+		var iconExternalID string
+		if err := tx.GetContext(ctx, &iconExternalID, "SELECT image_external_id FROM icons WHERE user_id = ?", userID); err == nil {
+			cacheUserIDToIconExternalID.Set(userID, iconExternalID)
+			return iconExternalID, nil
+		} else {
+			return fallbackImageID, nil
+		}
+	}
+	return iconExternalID, nil
+}
+
+// MARK: original
 
 type UserModel struct {
 	ID             int64  `db:"id"`
@@ -100,93 +150,6 @@ type PostIconRequest struct {
 
 type PostIconResponse struct {
 	ID int64 `json:"id"`
-}
-
-func getUserByID(ctx context.Context, tx *sqlx.Tx, userID int64) (UserModel, error) {
-	userIDKey := fmt.Sprintf("%d", userID)
-	userBytes, err := userIDToUser.Get(userIDKey)
-
-	var user UserModel
-	if err != nil {
-		if tx == nil {
-			return user, fmt.Errorf("transaction is nil")
-		}
-
-		if err := tx.GetContext(ctx, &user, "SELECT * FROM users WHERE id = ?", userID); err != nil {
-			return user, fmt.Errorf("failed to get user: %w", err)
-		}
-
-		userBytes, err = json.Marshal(user)
-		if err != nil {
-			return user, fmt.Errorf("failed to marshal user: %w", err)
-		}
-
-		if err := userIDToUser.Set(userIDKey, userBytes); err != nil {
-			return user, fmt.Errorf("failed to set user: %w", err)
-		}
-
-		return user, nil
-	}
-
-	if err := json.Unmarshal(userBytes, &user); err != nil {
-		return user, fmt.Errorf("failed to unmarshal user: %w", err)
-	}
-	return user, nil
-}
-
-func getUserIDByName(ctx context.Context, tx *sqlx.Tx, username string) (int64, error) {
-	userIDBytes, err := userNameToID.Get(username)
-	if err != nil {
-		if tx == nil {
-			return 0, fmt.Errorf("transaction is nil")
-		}
-
-		var userID int64
-		if err := tx.GetContext(ctx, &userID, "SELECT id FROM users WHERE name = ?", username); err != nil {
-			return 0, fmt.Errorf("failed to get user id by name: %w", err)
-		}
-
-		if err := userNameToID.Set(username, []byte(fmt.Sprintf("%d", userID))); err != nil {
-			return 0, fmt.Errorf("failed to set user id: %w", err)
-		}
-
-		return userID, nil
-	}
-	userID, err := strconv.Atoi(string(userIDBytes))
-	if err != nil {
-		return 0, fmt.Errorf("failed to convert user id to int: %w", err)
-	}
-	return int64(userID), nil
-}
-
-func getIconExternalIDByUserID(ctx context.Context, tx *sqlx.Tx, userID int64) (string, error) {
-	userIDKey := fmt.Sprintf("%d", userID)
-	iconExternalID, err := userIDToIconExternalID.Get(userIDKey)
-	fmt.Printf("try to get icon external id by user id: %d\n", userID)
-	if err != nil {
-		if tx == nil {
-			return "", fmt.Errorf("transaction is nil")
-		}
-
-		var iconExternalID string
-		if err := tx.GetContext(ctx, &iconExternalID, "SELECT image_external_id FROM icons WHERE user_id = ?", userID); err == nil {
-			if err := userIDToIconExternalID.Set(userIDKey, []byte(iconExternalID)); err != nil {
-				return "", fmt.Errorf("failed to set icon external id: %w", err)
-			}
-			return iconExternalID, nil
-		} else {
-			return fallbackImageID, nil
-		}
-	}
-	return string(iconExternalID), nil
-}
-
-func removeIconExternalCache(userID int64) error {
-	userIDKey := fmt.Sprintf("%d", userID)
-	if err := userIDToIconExternalID.Delete(userIDKey); err != nil {
-		return fmt.Errorf("failed to delete icon external id: %w", err)
-	}
-	return nil
 }
 
 func getIconHandler(c echo.Context) error {
@@ -265,7 +228,7 @@ func postIconHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to commit: "+err.Error())
 	}
 
-	_ = removeIconExternalCache(userID)
+	cacheUserIDToIconExternalID.Delete(userID)
 	return c.JSON(http.StatusCreated, &PostIconResponse{
 		ID: iconID,
 	})
@@ -368,6 +331,7 @@ func registerHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, string(out)+": "+err.Error())
 	}
 
+	log.Printf("user registered: %s, password: %s %s\n", req.Name, req.Password, hashedPassword)
 	return c.JSON(http.StatusCreated, user)
 }
 
@@ -388,14 +352,12 @@ func loginHandler(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
-	userID, err := getUserIDByName(ctx, tx, req.Username)
+	userModel, err := getUserByName(ctx, tx, req.Username)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusUnauthorized, "invalid username or password")
 	}
-	userModel, err := getUserByID(ctx, tx, userID)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user: "+err.Error())
-	}
+
+	fmt.Println("@@@", userModel.HashedPassword, req.Password)
 
 	err = bcrypt.CompareHashAndPassword([]byte(userModel.HashedPassword), []byte(req.Password))
 	if err == bcrypt.ErrMismatchedHashAndPassword {
@@ -452,7 +414,7 @@ func getUserHandler(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "not found user that has the given username")
 	}
-	user, err := fillUserResponse(ctx, tx, int64(userID))
+	user, err := fillUserResponse(ctx, tx, userID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fill user: "+err.Error())
 	}
@@ -488,39 +450,28 @@ func verifyUserSession(c echo.Context) error {
 }
 
 func fillUserResponse(ctx context.Context, tx *sqlx.Tx, userID int64) (User, error) {
-	var userModel UserModel
-	var themeModel ThemeModel
-	var imageID string
-
-	g, _ := errgroup.WithContext(ctx)
-	g.SetLimit(1)
-	g.Go(func() error {
-		var err error
-		userModel, err = getUserByID(ctx, tx, userID)
-		return err
-	})
-	g.Go(func() error {
-		var err error
-		themeModel, err = fetchThemeByUserID(ctx, tx, userID)
-		return err
-	})
-	g.Go(func() error {
-		var err error
-		imageID, err = getIconExternalIDByUserID(ctx, tx, userID)
-		return err
-	})
-
-	if err := g.Wait(); err != nil {
+	userModel, err := getUserByID(ctx, tx, userID)
+	if err != nil {
 		return User{}, err
 	}
-
+	themeModel, err := fetchThemeByUserID(ctx, tx, userID)
+	if err != nil {
+		return User{}, err
+	}
+	imageID, err := getIconExternalIDByUserID(ctx, tx, userID)
+	if err != nil {
+		return User{}, err
+	}
 	user := User{
 		ID:          userModel.ID,
 		Name:        userModel.Name,
 		DisplayName: userModel.DisplayName,
 		Description: userModel.Description,
-		Theme:       Theme{ID: themeModel.UserID, DarkMode: themeModel.DarkMode},
-		IconHash:    imageID,
+		Theme: Theme{
+			ID:       themeModel.UserID,
+			DarkMode: themeModel.DarkMode,
+		},
+		IconHash: imageID,
 	}
 
 	return user, nil

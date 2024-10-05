@@ -15,6 +15,8 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
+// MARK: Original
+
 type PostLivecommentRequest struct {
 	Comment string `json:"comment"`
 	Tip     int64  `json:"tip"`
