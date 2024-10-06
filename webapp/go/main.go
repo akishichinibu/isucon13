@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strconv"
 
+	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v4"
@@ -107,11 +108,31 @@ func connectDB(logger echo.Logger) (*sqlx.DB, error) {
 	return db, nil
 }
 
+func emptyCache[K comparable, V any](cache *cache.Cache[K, V]) {
+	for _, key := range cache.Keys() {
+		cache.Delete(key)
+	}
+}
+
 func initializeHandler(c echo.Context) error {
 	if out, err := exec.Command("../sql/init.sh").CombinedOutput(); err != nil {
 		c.Logger().Warnf("init.sh failed with err=%s", string(out))
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to initialize: "+err.Error())
 	}
+
+	emptyCache(cacheUserIDToUser)
+	emptyCache(cacheUserNameToID)
+	emptyCache(cacheUserIDToIconExternalID)
+	emptyCache(cacheLivestreamIDToLivestream)
+	emptyCache(cacheLivestreamIDToUserID)
+	emptyCache(cacheUserIDToLivestreams)
+	emptyCache(cacheLivestreamIDToTagsIDs)
+	emptyCache(cacheTagIDToLivestreams)
+	emptyCache(cacheLivestreamIDToComments)
+	emptyCache(cacheLivestreamIDToNGWords)
+	emptyCache(cacheLivecommentToUserID)
+	emptyCache(cacheLivecommentReport)
+	emptyCache(cacheIDToLivecomment)
 
 	c.Request().Header.Add("Content-Type", "application/json;charset=utf-8")
 	return c.JSON(http.StatusOK, InitializeResponse{

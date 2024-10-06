@@ -39,34 +39,32 @@ func init() {
 // MARK: repository
 func getUserByID(ctx context.Context, tx *sqlx.Tx, userID int64) (UserModel, error) {
 	user, ok := cacheUserIDToUser.Get(userID)
-	fmt.Printf("getUserByID: %d %v %v\n", userID, user, ok)
-	if !ok {
-		if tx == nil {
-			return user, fmt.Errorf("transaction is nil")
-		}
-		if err := tx.GetContext(ctx, &user, "SELECT * FROM users WHERE id = ? LIMIT 1", userID); err != nil {
-			return user, fmt.Errorf("failed to get user: %w", err)
-		}
-		cacheUserIDToUser.Set(userID, user)
+	if ok {
 		return user, nil
 	}
+	if tx == nil {
+		return user, fmt.Errorf("transaction is nil")
+	}
+	if err := tx.GetContext(ctx, &user, "SELECT * FROM users WHERE id = ? LIMIT 1", userID); err != nil {
+		return user, fmt.Errorf("failed to get user: %w", err)
+	}
+	cacheUserIDToUser.Set(userID, user)
 	return user, nil
 }
 
 func getUserIDByName(ctx context.Context, tx *sqlx.Tx, username string) (int64, error) {
 	userID, ok := cacheUserNameToID.Get(username)
 	fmt.Printf("getUserIDByName: %s %v %v\n", username, userID, ok)
-	if !ok {
-		if tx == nil {
-			return 0, fmt.Errorf("transaction is nil")
-		}
-		var userID int64
-		if err := tx.GetContext(ctx, &userID, "SELECT id FROM users WHERE name = ?", username); err != nil {
-			return 0, fmt.Errorf("failed to get user id by name: %w", err)
-		}
-		cacheUserNameToID.Set(username, userID)
+	if ok {
 		return userID, nil
 	}
+	if tx == nil {
+		return 0, fmt.Errorf("transaction is nil")
+	}
+	if err := tx.GetContext(ctx, &userID, "SELECT id FROM users WHERE name = ?", username); err != nil {
+		return 0, fmt.Errorf("failed to get user id by name: %w", err)
+	}
+	cacheUserNameToID.Set(username, userID)
 	return userID, nil
 }
 
@@ -332,6 +330,7 @@ func registerHandler(c echo.Context) error {
 	}
 
 	log.Printf("user registered: %s, password: %s %s\n", req.Name, req.Password, hashedPassword)
+	cacheUserIDToUser.Delete(userID)
 	return c.JSON(http.StatusCreated, user)
 }
 
@@ -357,9 +356,9 @@ func loginHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusUnauthorized, "invalid username or password")
 	}
 
-	fmt.Println("@@@", userModel.HashedPassword, req.Password)
-
 	err = bcrypt.CompareHashAndPassword([]byte(userModel.HashedPassword), []byte(req.Password))
+	fmt.Println("@@@", userModel.HashedPassword, req.Password, err)
+
 	if err == bcrypt.ErrMismatchedHashAndPassword {
 		return echo.NewHTTPError(http.StatusUnauthorized, "invalid username or password")
 	}
