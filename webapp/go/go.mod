@@ -3,6 +3,7 @@ module github.com/isucon/isucon13/webapp/go
 go 1.21
 
 require (
+	github.com/Code-Hex/go-generics-cache v1.5.1
 	github.com/go-sql-driver/mysql v1.7.1
 	github.com/google/uuid v1.3.1
 	github.com/gorilla/sessions v1.2.2
@@ -12,6 +13,8 @@ require (
 	github.com/labstack/gommon v0.4.0
 	golang.org/x/crypto v0.11.0
 )
+
+require golang.org/x/exp v0.0.0-20220328175248-053ad81199eb // indirect
 
 require (
 	github.com/golang-jwt/jwt v3.2.2+incompatible // indirect
