@@ -11,7 +11,7 @@ on:
 
 jobs:
   build-ami:
-    runs-on: [isucon13-ci-packer]
+    runs-on: ubuntu-latest
     name: Build
     strategy:
       matrix:
