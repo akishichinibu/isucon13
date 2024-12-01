@@ -1,0 +1,21 @@
+DROP INDEX idx_user_livestream ON ng_words;
+DROP INDEX idx_livestream_2 ON ng_words;
+DROP INDEX idx_livestream_1 ON livestreams;
+DROP INDEX idx_livecomments_1 ON livecomments;
+DROP INDEX idx_livecomments_2 ON livecomments;
+DROP INDEX idx_livecomment_reports_1 ON livecomment_reports;
+DROP INDEX idx_livestream_tags_1 ON livestream_tags;
+DROP INDEX idx_livestream_tags_2 ON livestream_tags;
+DROP INDEX idx_reservation_slots_1 ON reservation_slots;
+DROP INDEX idx_reactions_1 ON reactions;
+
+CREATE INDEX idx_user_livestream ON ng_words (user_id, livestream_id);
+CREATE INDEX idx_livestream_2 ON ng_words (livestream_id);
+CREATE INDEX idx_livestream_1 ON livestreams (user_id);
+CREATE INDEX idx_livecomments_1 ON livecomments (livestream_id);
+CREATE INDEX idx_livecomments_2 ON livecomments (tip);
+CREATE INDEX idx_livecomment_reports_1 ON livecomment_reports (livestream_id);
+CREATE INDEX idx_livestream_tags_1 ON livestream_tags (tag_id);
+CREATE INDEX idx_livestream_tags_2 ON livestream_tags (livestream_id);
+CREATE INDEX idx_reservation_slots_1 ON reservation_slots (start_at, end_at);
+CREATE INDEX idx_reactions_1 ON reactions (livestream_id);
