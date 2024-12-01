@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"errors"
+	"github.com/jmoiron/sqlx"
 	"net/http"
 	"sort"
 	"strconv"
@@ -234,24 +235,48 @@ func getLivestreamStatisticsHandler(c echo.Context) error {
 	}
 
 	// ランク算出
+	livestreamIDs := make([]int64, len(livestreams))
+	for i, livestream := range livestreams {
+		livestreamIDs[i] = livestream.ID
+	}
+
+	query := `
+	SELECT 
+		l.id AS livestream_id,
+		COUNT(r.id) AS reactions,
+		IFNULL(SUM(lc.tip), 0) AS total_tips
+	FROM livestreams l
+	LEFT JOIN reactions r ON l.id = r.livestream_id
+	LEFT JOIN livecomments lc ON l.id = lc.livestream_id
+	WHERE l.id IN (?)
+	GROUP BY l.id
+	`
+
+	var results []struct {
+		LivestreamID int64 `db:"livestream_id"`
+		Reactions    int64 `db:"reactions"`
+		TotalTips    int64 `db:"total_tips"`
+	}
+
+	query, args, err := sqlx.In(query, livestreamIDs)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to build query: "+err.Error())
+	}
+	query = tx.Rebind(query)
+
+	if err := tx.SelectContext(ctx, &results, query, args...); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch rankings: "+err.Error())
+	}
+
 	var ranking LivestreamRanking
-	for _, livestream := range livestreams {
-		var reactions int64
-		if err := tx.GetContext(ctx, &reactions, "SELECT COUNT(*) FROM livestreams l INNER JOIN reactions r ON l.id = r.livestream_id WHERE l.id = ?", livestream.ID); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to count reactions: "+err.Error())
-		}
-
-		var totalTips int64
-		if err := tx.GetContext(ctx, &totalTips, "SELECT IFNULL(SUM(l2.tip), 0) FROM livestreams l INNER JOIN livecomments l2 ON l.id = l2.livestream_id WHERE l.id = ?", livestream.ID); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to count tips: "+err.Error())
-		}
-
-		score := reactions + totalTips
+	for _, result := range results {
+		score := result.Reactions + result.TotalTips
 		ranking = append(ranking, LivestreamRankingEntry{
-			LivestreamID: livestream.ID,
+			LivestreamID: result.LivestreamID,
 			Score:        score,
 		})
 	}
+
 	sort.Sort(ranking)
 
 	var rank int64 = 1
