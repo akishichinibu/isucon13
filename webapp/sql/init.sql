@@ -1,6 +1,6 @@
 TRUNCATE TABLE themes;
 TRUNCATE TABLE icons;
-TRUNCATE TABLE reservation_slots;
+TABLE reservation_slots;
 TRUNCATE TABLE livestream_viewers_history;
 TRUNCATE TABLE livecomment_reports;
 TRUNCATE TABLE ng_words;
