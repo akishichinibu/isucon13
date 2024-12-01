@@ -29,7 +29,7 @@ jobs:
         go:
           - 1.21.1
     name: Build
-    runs-on: [isucon13-ci]
+    runs-on: ubuntu-latest
     steps:
       - name: Setup Go
         uses: actions/setup-go@v2
