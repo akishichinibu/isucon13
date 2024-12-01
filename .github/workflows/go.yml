@@ -1,29 +1,27 @@
-name: Node CI
-
+name: Go CI
 on:
   push:
     branches: [main]
     paths:
       - bench/**/*
-      - webapp/node/**/*
+      - webapp/go/**/*
       - webapp/sql/**/*
       - webapp/pdns/**/*
       - development/docker-compose-common.yml
-      - development/docker-compose-node.yml
+      - development/docker-compose-go.yml
       - development/Makefile
-      - .github/workflows/node.yml
+      - .github/workflows/go.yml
   pull_request:
     paths:
       - bench/**/*
-      - webapp/node/**/*
+      - webapp/go/**/*
       - webapp/sql/**/*
       - webapp/pdns/**/*
       - development/docker-compose-common.yml
-      - development/docker-compose-node.yml
+      - development/docker-compose-go.yml
       - development/Makefile
-      - .github/workflows/node.yml
+      - .github/workflows/go.yml
   workflow_dispatch:
-
 jobs:
   test:
     strategy:
@@ -31,35 +29,41 @@ jobs:
         go:
           - 1.21.1
     name: Build
-    runs-on: [isucon13-ci-05]
+    runs-on: ubuntu-latest
     steps:
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v2
         with:
           go-version: ${{ matrix.go }}
-
-      - uses: actions/setup-node@v4
+        id: go
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: corepack enable yarn
+      - name: Setup corepack
+        run: corepack enable yarn
 
       # to avoid error: Deleting the contents of '/home/ubuntu/actions-runner/_work/isucon13/isucon13'
       #                 Error: File was unable to be removed Error: EACCES: permission denied, rmdir
       # https://github.com/actions/checkout/issues/211
       - name: chown workdir
-        run: sudo chown -R $USER:$USER $GITHUB_WORKSPACE
-      - uses: actions/checkout@v4
+        run:
+          sudo chown -R $USER:$USER $GITHUB_WORKSPACE
+
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v3
 
       # containers
       - name: "setup containers"
         working-directory: ./development
         run: |
-          make down/node
-          make up/node
-
+          make down/go
+          make up/go
+      
       - name: "[frontend] build"
         working-directory: ./frontend
-        run: make
+        run: |
+          make
 
       # bench
       - name: "[bench] Get deps"
@@ -81,8 +85,3 @@ jobs:
         working-directory: ./bench
         run: |
           make bench
-
-      - name: Show webapp logs
-        if: ${{ always() }}
-        working-directory: ./development
-        run: sudo docker compose -f docker-compose-common.yml -f docker-compose-node.yml logs webapp
