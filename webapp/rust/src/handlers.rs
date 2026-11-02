@@ -1,10 +1,14 @@
-use std::sync::atomic::Ordering;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+
+use tokio::sync::Semaphore;
 
 use crate::http::{query_str, HttpResp};
 use crate::store::{
     now_unix, sha256_hex, shard_idx, LivecommentRec, LivestreamRec, NgWord, ReactionRec, ReportRec,
-    UserRec, ViewerRec, TERM_END_AT, TERM_START_AT, ZONE,
+    ThinComment, ThinReaction, UserRec, ViewerRec, TERM_END_AT, TERM_START_AT, ZONE,
 };
 use crate::{
     create_session, etag_matches, json_bytes, parse_json, rebuild_dns_names, require_auth, AppState,
@@ -20,7 +24,10 @@ fn install_loaded(inner: &Inner, loaded: store::Store, shards: Vec<store::LsShar
     inner.next_ng_word_id.store(loaded.next_ng_word_id, Ordering::Relaxed);
     inner.next_report_id.store(loaded.next_report_id, Ordering::Relaxed);
     let names = rebuild_dns_names(&loaded);
+    let rank = store::RankState::from_store(&loaded);
+    inner.total_tip.store(rank.total_tip, Ordering::Relaxed);
     *inner.store.write() = loaded;
+    *inner.rank.lock() = rank;
     inner.install_shards(shards);
     *inner.dns_names.write() = names;
     inner.sessions.write().clear();
@@ -138,62 +145,55 @@ pub fn reserve(state: &AppState, cookie: Option<&str>, body: &[u8]) -> Result<Ht
             start_at: req.start_at,
             end_at: req.end_at,
             tag_ids,
-            reaction_count: 0,
-            tip_sum: 0,
-            max_tip: 0,
-            viewers_count: 0,
-            reports_count: 0,
+            reaction_count: AtomicI64::new(0),
+            tip_sum: AtomicI64::new(0),
+            max_tip: AtomicI64::new(0),
+            viewers_count: AtomicI64::new(0),
+            reports_count: AtomicI64::new(0),
         },
     );
     if let Some(user) = store.users.get_mut(&auth.user_id) {
         user.livestream_ids.push(livestream_id);
     }
-    store.ls_rank_index.insert((0, livestream_id));
+    store.livestream_ids_desc.insert(0, livestream_id);
     store.cache_livestream(livestream_id);
-    drop(store);
-    let livestream = state
-        .inner
-        .store
-        .read()
-        .fill_livestream(livestream_id)
+    let body = store
+        .ls_json(livestream_id)
         .ok_or_else(|| Error::internal("failed to fill livestream"))?;
-    json_created(&livestream)
+    drop(store);
+    state.inner.rank.lock().insert_ls(livestream_id);
+    Ok(HttpResp::json(201, body.to_vec()))
 }
 
 pub fn search(state: &AppState, query: &[(String, String)]) -> Result<HttpResp, Error> {
     let tag = query_str(query, "tag");
-    let limit = query_str(query, "limit");
+    let limit = parse_limit(query)?;
     let store = state.inner.store.read();
-    let mut ids: Vec<i64> = if tag.is_empty() {
-        let mut ids: Vec<i64> = store.livestreams.keys().copied().collect();
-        ids.sort_unstable_by(|a, b| b.cmp(a));
-        if !limit.is_empty() {
-            let n: usize = limit
-                .parse()
-                .map_err(|_| Error::bad("limit query parameter must be integer"))?;
-            ids.truncate(n);
-        }
-        ids
+    let ids: &[i64] = if tag.is_empty() {
+        &store.livestream_ids_desc
     } else if let Some(tag_id) = store.tags_by_name.get(tag) {
         store
             .livestreams_by_tag
             .get(tag_id)
-            .cloned()
-            .unwrap_or_default()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     } else {
-        Vec::new()
+        &[]
     };
-    if !tag.is_empty() {
-        ids.sort_unstable_by(|a, b| b.cmp(a));
-        ids.dedup();
-    }
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(ls) = store.fill_livestream(id) {
-            out.push(ls);
-        }
-    }
-    json_ok(&out)
+    let ids = if tag.is_empty() {
+        let n = limit.unwrap_or(ids.len()).min(ids.len());
+        &ids[..n]
+    } else {
+        ids
+    };
+    Ok(HttpResp::json(200, livestream_array_json(&store, ids)))
+}
+
+fn livestream_array_json(store: &store::Store, ids: &[i64]) -> Vec<u8> {
+    store::assemble_json_array(
+        ids.iter()
+            .filter_map(|id| store.cached_ls_json.get(id).map(|b| b.as_ref())),
+    )
 }
 
 pub fn my_livestreams(state: &AppState, cookie: Option<&str>) -> Result<HttpResp, Error> {
@@ -204,13 +204,7 @@ pub fn my_livestreams(state: &AppState, cookie: Option<&str>) -> Result<HttpResp
         .get(&auth.user_id)
         .map(|u| u.livestream_ids.clone())
         .unwrap_or_default();
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(ls) = store.fill_livestream(id) {
-            out.push(ls);
-        }
-    }
-    json_ok(&out)
+    Ok(HttpResp::json(200, livestream_array_json(&store, &ids)))
 }
 
 pub fn user_livestreams(
@@ -229,13 +223,7 @@ pub fn user_livestreams(
         .get(&user_id)
         .map(|u| u.livestream_ids.clone())
         .unwrap_or_default();
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(ls) = store.fill_livestream(id) {
-            out.push(ls);
-        }
-    }
-    json_ok(&out)
+    Ok(HttpResp::json(200, livestream_array_json(&store, &ids)))
 }
 
 pub fn enter(state: &AppState, cookie: Option<&str>, livestream_id: i64) -> Result<HttpResp, Error> {
@@ -251,7 +239,7 @@ pub fn enter(state: &AppState, cookie: Option<&str>, livestream_id: i64) -> Resu
                 created_at: now_unix(),
             });
     }
-    state.inner.store.write().add_viewer_stats(livestream_id, 1);
+    state.inner.store.read().add_viewer_stats(livestream_id, 1);
     Ok(HttpResp::empty(200))
 }
 
@@ -271,7 +259,7 @@ pub fn exit(state: &AppState, cookie: Option<&str>, livestream_id: i64) -> Resul
         state
             .inner
             .store
-            .write()
+            .read()
             .add_viewer_stats(livestream_id, -removed);
     }
     Ok(HttpResp::empty(200))
@@ -284,10 +272,10 @@ pub fn get_livestream(
 ) -> Result<HttpResp, Error> {
     require_auth(state, cookie)?;
     let store = state.inner.store.read();
-    let livestream = store
-        .fill_livestream(livestream_id)
+    let body = store
+        .ls_json(livestream_id)
         .ok_or_else(|| Error::not_found("not found livestream that has the given id"))?;
-    json_ok(&livestream)
+    Ok(HttpResp::json(200, body.to_vec()))
 }
 
 pub fn get_reports(
@@ -345,7 +333,7 @@ pub fn get_reports(
                 id: c.id,
                 user: comment_user,
                 livestream: livestream.clone(),
-                comment: c.comment.clone(),
+                comment: c.comment.to_string(),
                 tip: c.tip,
                 created_at: c.created_at,
             },
@@ -374,42 +362,46 @@ pub fn get_livecomments(
 ) -> Result<HttpResp, Error> {
     require_auth(state, cookie)?;
     let limit = parse_limit(query)?;
-    let shard = state.inner.shards[shard_idx(livestream_id)].read();
-    let ids = shard
-        .comments_by_ls
-        .get(&livestream_id)
-        .cloned()
-        .unwrap_or_default();
-    let iter = ids.into_iter().rev();
-    let chosen: Vec<i64> = match limit {
-        Some(n) => iter.take(n).collect(),
-        None => iter.collect(),
+    let rows = {
+        let shard = state.inner.shards[shard_idx(livestream_id)].read();
+        let ids = shard
+            .comments_by_ls
+            .get(&livestream_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let take = limit.unwrap_or(ids.len()).min(ids.len());
+        let slice = &ids[ids.len() - take..];
+        let mut rows = Vec::with_capacity(slice.len());
+        for id in slice.iter().rev() {
+            let c = shard
+                .comments
+                .get(id)
+                .ok_or_else(|| Error::internal("failed to fil livecomments"))?;
+            rows.push(ThinComment {
+                id: c.id,
+                user_id: c.user_id,
+                comment: Arc::clone(&c.comment),
+                tip: c.tip,
+                created_at: c.created_at,
+            });
+        }
+        rows
     };
     let store = state.inner.store.read();
-    let livestream = store
-        .fill_livestream(livestream_id)
+    let ls = store
+        .ls_json(livestream_id)
         .ok_or_else(|| Error::internal("failed to fil livecomments"))?;
-    let mut out = Vec::with_capacity(chosen.len());
-    for id in chosen {
-        let c = shard
-            .comments
-            .get(&id)
-            .ok_or_else(|| Error::internal("failed to fil livecomments"))?;
-        let user = store
-            .users
-            .get(&c.user_id)
-            .ok_or_else(|| Error::internal("failed to fil livecomments"))?
-            .to_public();
-        out.push(store::Livecomment {
-            id: c.id,
-            user,
-            livestream: livestream.clone(),
-            comment: c.comment.clone(),
-            tip: c.tip,
-            created_at: c.created_at,
-        });
+    let mut users = HashMap::new();
+    for row in &rows {
+        if let std::collections::hash_map::Entry::Vacant(e) = users.entry(row.user_id) {
+            let json = store
+                .user_json(row.user_id)
+                .ok_or_else(|| Error::internal("failed to fil livecomments"))?;
+            e.insert(json);
+        }
     }
-    json_ok(&out)
+    drop(store);
+    Ok(HttpResp::json(200, store::assemble_comments(&rows, &users, &ls)))
 }
 
 pub fn get_ngwords(
@@ -459,6 +451,7 @@ pub fn post_livecomment(
         .next_livecomment_id
         .fetch_add(1, Ordering::Relaxed);
     let created_at = now_unix();
+    let comment: Arc<str> = Arc::from(req.comment);
     {
         let mut shard = state.inner.shards[shard_idx(livestream_id)].write();
         let hit = shard
@@ -468,7 +461,7 @@ pub fn post_livecomment(
             .flatten()
             .filter_map(|wid| shard.ng_words.get(wid))
             .filter(|w| w.user_id == owner_id)
-            .any(|w| req.comment.contains(&w.word));
+            .any(|w| comment.contains(w.word.as_str()));
         if hit {
             return Err(Error::bad("このコメントがスパム判定されました"));
         }
@@ -478,7 +471,7 @@ pub fn post_livecomment(
                 id,
                 user_id: auth.user_id,
                 livestream_id,
-                comment: req.comment.clone(),
+                comment: Arc::clone(&comment),
                 tip: req.tip,
                 created_at,
             },
@@ -489,28 +482,19 @@ pub fn post_livecomment(
             .or_default()
             .push(id);
     }
-    state
-        .inner
-        .store
-        .write()
-        .add_comment_stats(livestream_id, req.tip);
+    state.inner.bump_comment(livestream_id, owner_id, req.tip);
     let store = state.inner.store.read();
     let user = store
-        .users
-        .get(&auth.user_id)
-        .ok_or_else(|| Error::internal("failed to fill livecomment"))?
-        .to_public();
-    let livestream = store
-        .fill_livestream(livestream_id)
+        .user_json(auth.user_id)
         .ok_or_else(|| Error::internal("failed to fill livecomment"))?;
-    json_created(&store::Livecomment {
-        id,
-        user,
-        livestream,
-        comment: req.comment,
-        tip: req.tip,
-        created_at,
-    })
+    let ls = store
+        .ls_json(livestream_id)
+        .ok_or_else(|| Error::internal("failed to fill livecomment"))?;
+    drop(store);
+    Ok(HttpResp::json(
+        201,
+        store::assemble_comment(id, &user, &ls, comment.as_ref(), req.tip, created_at),
+    ))
 }
 
 pub fn post_report(
@@ -552,14 +536,8 @@ pub fn post_report(
             .or_default()
             .push(id);
     }
-    if let Some(ls) = state
-        .inner
-        .store
-        .write()
-        .livestreams
-        .get_mut(&livestream_id)
-    {
-        ls.reports_count += 1;
+    if let Some(ls) = state.inner.store.read().livestreams.get(&livestream_id) {
+        ls.reports_count.fetch_add(1, Ordering::Relaxed);
     }
     let shard = state.inner.shards[shard_idx(livestream_id)].read();
     let store = state.inner.store.read();
@@ -591,7 +569,7 @@ pub fn post_report(
             id: c.id,
             user: comment_user,
             livestream,
-            comment: c.comment.clone(),
+            comment: c.comment.to_string(),
             tip: c.tip,
             created_at: c.created_at,
         },
@@ -648,12 +626,9 @@ pub fn moderate(
         let max_tip = shard.max_tip(livestream_id);
         (tips, max_tip)
     };
-    {
-        let mut store = state.inner.store.write();
-        for tip in removed_tips.0 {
-            store.remove_comment_stats(livestream_id, tip, removed_tips.1);
-        }
-    }
+    state
+        .inner
+        .unbump_tips(livestream_id, auth.user_id, &removed_tips.0, removed_tips.1);
     json_created(&serde_json::json!({ "word_id": word_id }))
 }
 
@@ -665,41 +640,45 @@ pub fn get_reactions(
 ) -> Result<HttpResp, Error> {
     require_auth(state, cookie)?;
     let limit = parse_limit(query)?;
-    let shard = state.inner.shards[shard_idx(livestream_id)].read();
-    let ids = shard
-        .reactions_by_ls
-        .get(&livestream_id)
-        .cloned()
-        .unwrap_or_default();
-    let iter = ids.into_iter().rev();
-    let chosen: Vec<i64> = match limit {
-        Some(n) => iter.take(n).collect(),
-        None => iter.collect(),
+    let rows = {
+        let shard = state.inner.shards[shard_idx(livestream_id)].read();
+        let ids = shard
+            .reactions_by_ls
+            .get(&livestream_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let take = limit.unwrap_or(ids.len()).min(ids.len());
+        let slice = &ids[ids.len() - take..];
+        let mut rows = Vec::with_capacity(slice.len());
+        for id in slice.iter().rev() {
+            let r = shard
+                .reactions
+                .get(id)
+                .ok_or_else(|| Error::internal("failed to fill reaction"))?;
+            rows.push(ThinReaction {
+                id: r.id,
+                emoji_name: Arc::clone(&r.emoji_name),
+                user_id: r.user_id,
+                created_at: r.created_at,
+            });
+        }
+        rows
     };
     let store = state.inner.store.read();
-    let livestream = store
-        .fill_livestream(livestream_id)
+    let ls = store
+        .ls_json(livestream_id)
         .ok_or_else(|| Error::internal("failed to fill reaction"))?;
-    let mut out = Vec::with_capacity(chosen.len());
-    for id in chosen {
-        let r = shard
-            .reactions
-            .get(&id)
-            .ok_or_else(|| Error::internal("failed to fill reaction"))?;
-        let user = store
-            .users
-            .get(&r.user_id)
-            .ok_or_else(|| Error::internal("failed to fill reaction"))?
-            .to_public();
-        out.push(store::Reaction {
-            id: r.id,
-            emoji_name: r.emoji_name.clone(),
-            user,
-            livestream: livestream.clone(),
-            created_at: r.created_at,
-        });
+    let mut users = HashMap::new();
+    for row in &rows {
+        if let std::collections::hash_map::Entry::Vacant(e) = users.entry(row.user_id) {
+            let json = store
+                .user_json(row.user_id)
+                .ok_or_else(|| Error::internal("failed to fill reaction"))?;
+            e.insert(json);
+        }
     }
-    json_ok(&out)
+    drop(store);
+    Ok(HttpResp::json(200, store::assemble_reactions(&rows, &users, &ls)))
 }
 
 #[derive(serde::Deserialize)]
@@ -715,15 +694,24 @@ pub fn post_reaction(
 ) -> Result<HttpResp, Error> {
     let auth = require_auth(state, cookie)?;
     let req: PostReactionRequest = parse_json(body)?;
+    let owner_id = {
+        let store = state.inner.store.read();
+        store
+            .livestreams
+            .get(&livestream_id)
+            .map(|ls| ls.user_id)
+            .ok_or_else(|| Error::not_found("livestream not found"))?
+    };
     let id = state.inner.next_reaction_id.fetch_add(1, Ordering::Relaxed);
     let created_at = now_unix();
+    let emoji: Arc<str> = Arc::from(req.emoji_name);
     {
         let mut shard = state.inner.shards[shard_idx(livestream_id)].write();
         shard.reactions.insert(
             id,
             ReactionRec {
                 id,
-                emoji_name: req.emoji_name.clone(),
+                emoji_name: Arc::clone(&emoji),
                 user_id: auth.user_id,
                 livestream_id,
                 created_at,
@@ -737,25 +725,19 @@ pub fn post_reaction(
     }
     state
         .inner
-        .store
-        .write()
-        .add_reaction_stats(livestream_id, &req.emoji_name);
+        .bump_reaction(livestream_id, owner_id, emoji.as_ref());
     let store = state.inner.store.read();
     let user = store
-        .users
-        .get(&auth.user_id)
-        .ok_or_else(|| Error::internal("failed to fill reaction"))?
-        .to_public();
-    let livestream = store
-        .fill_livestream(livestream_id)
+        .user_json(auth.user_id)
         .ok_or_else(|| Error::internal("failed to fill reaction"))?;
-    json_created(&store::Reaction {
-        id,
-        emoji_name: req.emoji_name,
-        user,
-        livestream,
-        created_at,
-    })
+    let ls = store
+        .ls_json(livestream_id)
+        .ok_or_else(|| Error::internal("failed to fill reaction"))?;
+    drop(store);
+    Ok(HttpResp::json(
+        201,
+        store::assemble_reaction(id, emoji.as_ref(), &user, &ls, created_at),
+    ))
 }
 
 fn from_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -821,10 +803,16 @@ pub fn get_icon(
     Ok(HttpResp::bytes(200, "image/jpeg", body.to_vec()).with_etag(hash))
 }
 
-pub fn post_icon(state: &AppState, cookie: Option<&str>, body: &[u8]) -> Result<HttpResp, Error> {
+pub async fn post_icon(state: &AppState, cookie: Option<&str>, body: &[u8]) -> Result<HttpResp, Error> {
     let auth = require_auth(state, cookie)?;
     let req: PostIconRequest = parse_json(body)?;
-    let hash = sha256_hex(&req.image);
+    let (image, hash) = tokio::task::spawn_blocking(move || {
+        let hash = sha256_hex(&req.image);
+        (req.image, hash)
+    })
+    .await
+    .map_err(|e| Error::internal(format!("sha256 join: {e}")))?;
+    let req_image = image;
     let mut store = state.inner.store.write();
     let icon_id = store.next_icon_id;
     store.next_icon_id += 1;
@@ -832,7 +820,7 @@ pub fn post_icon(state: &AppState, cookie: Option<&str>, body: &[u8]) -> Result<
         .users
         .get_mut(&auth.user_id)
         .ok_or_else(|| Error::not_found("not found user that has the userid in session"))?;
-    user.icon = Some(Bytes::from(req.image));
+    user.icon = Some(Bytes::from(req_image));
     user.icon_hash = hash;
     user.icon_id = icon_id;
     store.invalidate_owner_cache(auth.user_id);
@@ -842,20 +830,45 @@ pub fn post_icon(state: &AppState, cookie: Option<&str>, body: &[u8]) -> Result<
 pub fn me(state: &AppState, cookie: Option<&str>) -> Result<HttpResp, Error> {
     let auth = require_auth(state, cookie)?;
     let store = state.inner.store.read();
-    let user = store
-        .users
-        .get(&auth.user_id)
+    let body = store
+        .user_json(auth.user_id)
         .ok_or_else(|| Error::not_found("not found user that has the userid in session"))?;
-    json_ok(&user.to_public())
+    Ok(HttpResp::json(200, body.to_vec()))
 }
 
-pub fn register(state: &AppState, body: &[u8]) -> Result<HttpResp, Error> {
+fn bcrypt_slots() -> &'static Semaphore {
+    static SLOTS: OnceLock<Semaphore> = OnceLock::new();
+    SLOTS.get_or_init(|| Semaphore::new(2))
+}
+
+async fn hash_password(password: String) -> Result<String, Error> {
+    let _permit = bcrypt_slots()
+        .acquire()
+        .await
+        .map_err(|_| Error::internal("bcrypt semaphore closed"))?;
+    tokio::task::spawn_blocking(move || bcrypt::hash(password, BCRYPT_COST))
+        .await
+        .map_err(|e| Error::internal(format!("bcrypt join: {e}")))?
+        .map_err(|e| Error::internal(format!("failed to generate hashed password: {e}")))
+}
+
+async fn verify_password(password: String, hashed: String) -> Result<bool, Error> {
+    let _permit = bcrypt_slots()
+        .acquire()
+        .await
+        .map_err(|_| Error::internal("bcrypt semaphore closed"))?;
+    tokio::task::spawn_blocking(move || bcrypt::verify(password, &hashed))
+        .await
+        .map_err(|e| Error::internal(format!("bcrypt join: {e}")))?
+        .map_err(|e| Error::internal(format!("failed to compare hash and password: {e}")))
+}
+
+pub async fn register(state: &AppState, body: &[u8]) -> Result<HttpResp, Error> {
     let req: PostUserRequest = parse_json(body)?;
     if req.name == "pipe" {
         return Err(Error::bad("the username 'pipe' is reserved"));
     }
-    let hashed_password = bcrypt::hash(&req.password, BCRYPT_COST)
-        .map_err(|e| Error::internal(format!("failed to generate hashed password: {e}")))?;
+    let hashed_password = hash_password(req.password).await?;
     let mut store = state.inner.store.write();
     if store.users_by_name.contains_key(&req.name) {
         return Err(Error::internal("failed to insert user: duplicate username"));
@@ -878,26 +891,29 @@ pub fn register(state: &AppState, body: &[u8]) -> Result<HttpResp, Error> {
         icon: None,
         icon_id: 0,
         livestream_ids: Vec::new(),
-        reaction_count: 0,
-        tip_sum: 0,
-        livecomment_count: 0,
-        viewers_count: 0,
+        reaction_count: AtomicI64::new(0),
+        tip_sum: AtomicI64::new(0),
+        livecomment_count: AtomicI64::new(0),
+        viewers_count: AtomicI64::new(0),
         emoji_counts: Default::default(),
     };
-    let public = rec.to_public();
     store.users_by_name.insert(req.name.clone(), user_id);
-    store.user_rank_index.insert((0, req.name.clone()));
     store.users.insert(user_id, rec);
+    store.cache_user_json(user_id);
+    let body = store
+        .user_json(user_id)
+        .ok_or_else(|| Error::internal("failed to fill user"))?;
     drop(store);
+    state.inner.rank.lock().insert_user(user_id, req.name.clone());
     state
         .inner
         .dns_names
         .write()
         .insert(format!("{}.{ZONE}", req.name.to_ascii_lowercase()));
-    json_created(&public)
+    Ok(HttpResp::json(201, body.to_vec()))
 }
 
-pub fn login(state: &AppState, body: &[u8]) -> Result<HttpResp, Error> {
+pub async fn login(state: &AppState, body: &[u8]) -> Result<HttpResp, Error> {
     let req: LoginRequest = parse_json(body)?;
     let (user_id, hashed) = {
         let store = state.inner.store.read();
@@ -911,14 +927,8 @@ pub fn login(state: &AppState, body: &[u8]) -> Result<HttpResp, Error> {
             .ok_or_else(|| Error::unauthorized("invalid username or password"))?;
         (user.id, user.hashed_password.clone())
     };
-    match bcrypt::verify(&req.password, &hashed) {
-        Ok(true) => {}
-        Ok(false) => return Err(Error::unauthorized("invalid username or password")),
-        Err(e) => {
-            return Err(Error::internal(format!(
-                "failed to compare hash and password: {e}"
-            )))
-        }
+    if !verify_password(req.password, hashed).await? {
+        return Err(Error::unauthorized("invalid username or password"));
     }
     let sid = create_session(state, user_id);
     Ok(HttpResp::empty(200).cookie(format!("{SESSION_COOKIE}={sid}")))
@@ -931,11 +941,10 @@ pub fn get_user(state: &AppState, cookie: Option<&str>, username: &str) -> Resul
         .users_by_name
         .get(username)
         .ok_or_else(|| Error::not_found("not found user that has the given username"))?;
-    let user = store
-        .users
-        .get(&user_id)
+    let body = store
+        .user_json(user_id)
         .ok_or_else(|| Error::not_found("not found user that has the given username"))?;
-    json_ok(&user.to_public())
+    Ok(HttpResp::json(200, body.to_vec()))
 }
 
 pub fn user_stats(state: &AppState, cookie: Option<&str>, username: &str) -> Result<HttpResp, Error> {
@@ -949,16 +958,25 @@ pub fn user_stats(state: &AppState, cookie: Option<&str>, username: &str) -> Res
         .users
         .get(&user_id)
         .ok_or_else(|| Error::bad("not found user that has the given username"))?;
-    let rank = store
-        .user_rank(username)
+    let viewers_count = user.viewers_count.load(Ordering::Relaxed);
+    let total_reactions = user.reaction_count.load(Ordering::Relaxed);
+    let total_livecomments = user.livecomment_count.load(Ordering::Relaxed);
+    let total_tip = user.tip_sum.load(Ordering::Relaxed);
+    let favorite_emoji = user.favorite_emoji();
+    drop(store);
+    let rank = state
+        .inner
+        .rank
+        .lock()
+        .user_rank(user_id)
         .ok_or_else(|| Error::bad("not found user that has the given username"))?;
     json_ok(&serde_json::json!({
         "rank": rank,
-        "viewers_count": user.viewers_count,
-        "total_reactions": user.reaction_count,
-        "total_livecomments": user.livecomment_count,
-        "total_tip": user.tip_sum,
-        "favorite_emoji": user.favorite_emoji(),
+        "viewers_count": viewers_count,
+        "total_reactions": total_reactions,
+        "total_livecomments": total_livecomments,
+        "total_tip": total_tip,
+        "favorite_emoji": favorite_emoji,
     }))
 }
 
@@ -973,21 +991,30 @@ pub fn livestream_stats(
         .livestreams
         .get(&livestream_id)
         .ok_or_else(|| Error::bad("cannot get stats of not found livestream"))?;
-    let rank = store
+    let viewers_count = ls.viewers_count.load(Ordering::Relaxed);
+    let total_reactions = ls.reaction_count.load(Ordering::Relaxed);
+    let total_reports = ls.reports_count.load(Ordering::Relaxed);
+    let max_tip = ls.max_tip.load(Ordering::Relaxed);
+    drop(store);
+    let rank = state
+        .inner
+        .rank
+        .lock()
         .livestream_rank(livestream_id)
         .ok_or_else(|| Error::bad("cannot get stats of not found livestream"))?;
     json_ok(&serde_json::json!({
         "rank": rank,
-        "viewers_count": ls.viewers_count,
-        "total_reactions": ls.reaction_count,
-        "total_reports": ls.reports_count,
-        "max_tip": ls.max_tip,
+        "viewers_count": viewers_count,
+        "total_reactions": total_reactions,
+        "total_reports": total_reports,
+        "max_tip": max_tip,
     }))
 }
 
 pub fn payment(state: &AppState) -> Result<HttpResp, Error> {
-    let store = state.inner.store.read();
-    json_ok(&serde_json::json!({ "total_tip": store.total_tip }))
+    json_ok(&serde_json::json!({
+        "total_tip": state.inner.total_tip.load(Ordering::Relaxed)
+    }))
 }
 
 pub async fn reload_on_boot(inner: &Inner) {

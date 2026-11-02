@@ -1,17 +1,18 @@
 pub mod dns;
 pub mod handlers;
 pub mod http;
+pub mod pprof;
 pub mod store;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::de::DeserializeOwned;
 use sqlx::MySqlPool;
-use store::{LsShard, Store, SHARDS};
+use store::{LsShard, RankState, Store, SHARDS};
 
 pub const SESSION_COOKIE: &str = "SESSIONID";
 pub const BCRYPT_COST: u32 = 4;
@@ -55,6 +56,7 @@ pub struct SessionRec {
 
 pub struct Inner {
     pub store: RwLock<Store>,
+    pub rank: Mutex<RankState>,
     pub shards: Vec<RwLock<LsShard>>,
     pub dns_names: Arc<RwLock<HashSet<String>>>,
     pub pool: MySqlPool,
@@ -66,6 +68,7 @@ pub struct Inner {
     pub next_reaction_id: AtomicI64,
     pub next_ng_word_id: AtomicI64,
     pub next_report_id: AtomicI64,
+    pub total_tip: AtomicI64,
 }
 
 impl Inner {
@@ -76,6 +79,31 @@ impl Inner {
     pub fn install_shards(&self, shards: Vec<LsShard>) {
         for (i, shard) in shards.into_iter().enumerate() {
             *self.shards[i].write() = shard;
+        }
+    }
+
+    pub fn bump_comment(&self, livestream_id: i64, owner_id: i64, tip: i64) {
+        self.store.read().add_comment_stats(livestream_id, tip);
+        if tip != 0 {
+            self.total_tip.fetch_add(tip, Ordering::Relaxed);
+            self.rank.lock().add_tip(livestream_id, owner_id, tip);
+        }
+    }
+
+    pub fn bump_reaction(&self, livestream_id: i64, owner_id: i64, emoji: &str) {
+        self.store.read().add_reaction_stats(livestream_id, emoji);
+        self.rank.lock().add_reaction(livestream_id, owner_id);
+    }
+
+    pub fn unbump_tips(&self, livestream_id: i64, owner_id: i64, tips: &[i64], new_max_tip: i64) {
+        let store = self.store.read();
+        let mut rank = self.rank.lock();
+        for &tip in tips {
+            store.remove_comment_stats(livestream_id, tip, new_max_tip);
+            if tip != 0 {
+                self.total_tip.fetch_sub(tip, Ordering::Relaxed);
+                rank.remove_tip(livestream_id, owner_id, tip);
+            }
         }
     }
 }

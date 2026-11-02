@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -10,14 +11,21 @@ const DNS_PORT: u16 = 53;
 const WORKERS: usize = 4;
 const TTL: u32 = 0;
 
+static A_RR: AtomicUsize = AtomicUsize::new(0);
+
 /// In-process authoritative UDP/53 for u.isucon.dev.
-pub fn start(names: Arc<RwLock<HashSet<String>>>, ipv4: [u8; 4]) {
+/// Answers list every webapp TLS IP. Order rotates so clients that pick the
+/// first A split across the nginx edges.
+pub fn start(names: Arc<RwLock<HashSet<String>>>, ipv4s: Vec<[u8; 4]>) {
+    assert!(!ipv4s.is_empty(), "at least one A-record IP");
+    let ipv4s = Arc::new(ipv4s);
     for i in 0..WORKERS {
         let names = names.clone();
+        let ipv4s = ipv4s.clone();
         thread::Builder::new()
             .name(format!("dns-{i}"))
             .spawn(move || {
-                if let Err(err) = worker(names, ipv4) {
+                if let Err(err) = worker(names, ipv4s) {
                     tracing::error!("dns worker failed: {err}");
                 }
             })
@@ -26,7 +34,7 @@ pub fn start(names: Arc<RwLock<HashSet<String>>>, ipv4: [u8; 4]) {
     tracing::info!("in-process DNS listening on UDP/{DNS_PORT}");
 }
 
-fn worker(names: Arc<RwLock<HashSet<String>>>, ipv4: [u8; 4]) -> std::io::Result<()> {
+fn worker(names: Arc<RwLock<HashSet<String>>>, ipv4s: Arc<Vec<[u8; 4]>>) -> std::io::Result<()> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
     let _ = sock.set_reuse_port(true);
@@ -48,13 +56,32 @@ fn worker(names: Arc<RwLock<HashSet<String>>>, ipv4: [u8; 4]) -> std::io::Result
                 continue;
             }
         };
-        if let Some(resp) = handle_query(&buf[..n], &names, ipv4) {
+        if let Some(resp) = handle_query(&buf[..n], &names, &ipv4s) {
             let _ = udp.send_to(&resp, addr);
         }
     }
 }
 
-fn handle_query(msg: &[u8], names: &RwLock<HashSet<String>>, ipv4: [u8; 4]) -> Option<Vec<u8>> {
+fn encode_a(out: &mut Vec<u8>, ipv4: [u8; 4]) {
+    out.extend_from_slice(&[0xc0, 0x0c]); // pointer to QNAME
+    out.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+    out.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+    out.extend_from_slice(&TTL.to_be_bytes());
+    out.extend_from_slice(&4u16.to_be_bytes());
+    out.extend_from_slice(&ipv4);
+}
+
+fn encode_a_records(ipv4s: &[[u8; 4]]) -> Vec<u8> {
+    let n = ipv4s.len();
+    let start = A_RR.fetch_add(1, Ordering::Relaxed) % n;
+    let mut rdata = Vec::with_capacity(n * 16);
+    for i in 0..n {
+        encode_a(&mut rdata, ipv4s[(start + i) % n]);
+    }
+    rdata
+}
+
+fn handle_query(msg: &[u8], names: &RwLock<HashSet<String>>, ipv4s: &[[u8; 4]]) -> Option<Vec<u8>> {
     if msg.len() < 12 {
         return None;
     }
@@ -74,15 +101,8 @@ fn handle_query(msg: &[u8], names: &RwLock<HashSet<String>>, ipv4: [u8; 4]) -> O
 
     match qtype {
         1 if exists => {
-            // A
-            let mut rdata = Vec::with_capacity(16);
-            rdata.extend_from_slice(&[0xc0, 0x0c]); // pointer to QNAME
-            rdata.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
-            rdata.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
-            rdata.extend_from_slice(&TTL.to_be_bytes());
-            rdata.extend_from_slice(&4u16.to_be_bytes());
-            rdata.extend_from_slice(&ipv4);
-            Some(build_response(msg, qend, 0, 1, &rdata))
+            let rdata = encode_a_records(ipv4s);
+            Some(build_response(msg, qend, 0, ipv4s.len() as u16, &rdata))
         }
         2 if qname == crate::store::ZONE => {
             // NS for apex

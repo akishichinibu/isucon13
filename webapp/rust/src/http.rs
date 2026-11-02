@@ -413,8 +413,8 @@ async fn dispatch(state: AppState, req: Parsed) -> HttpResp {
         }
         Route::PostEnter { id } => handlers::enter(&state, req.session.as_deref(), id),
         Route::DeleteExit { id } => handlers::exit(&state, req.session.as_deref(), id),
-        Route::PostRegister => handlers::register(&state, &req.body),
-        Route::PostLogin => handlers::login(&state, &req.body),
+        Route::PostRegister => handlers::register(&state, &req.body).await,
+        Route::PostLogin => handlers::login(&state, &req.body).await,
         Route::GetMe => handlers::me(&state, req.session.as_deref()),
         Route::GetUser { username } => handlers::get_user(&state, req.session.as_deref(), &username),
         Route::GetUserStats { username } => {
@@ -423,7 +423,7 @@ async fn dispatch(state: AppState, req: Parsed) -> HttpResp {
         Route::GetIcon { username } => {
             handlers::get_icon(&state, &username, req.if_none_match.as_deref())
         }
-        Route::PostIcon => handlers::post_icon(&state, req.session.as_deref(), &req.body),
+        Route::PostIcon => handlers::post_icon(&state, req.session.as_deref(), &req.body).await,
         Route::GetLivestreamStats { id } => {
             handlers::livestream_stats(&state, req.session.as_deref(), id)
         }

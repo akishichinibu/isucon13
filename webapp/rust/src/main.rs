@@ -4,16 +4,27 @@ use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use isupipe::store::{Store, FALLBACK_IMAGE_PATH};
+use isupipe::store::{RankState, Store, FALLBACK_IMAGE_PATH};
 use isupipe::{dns, handlers, http, mysql_options, rebuild_dns_names, AppState, Inner};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use sqlx::mysql::MySqlPoolOptions;
 use tokio::net::{TcpListener, UnixListener};
 
-fn parse_ipv4(s: &str) -> [u8; 4] {
-    s.parse::<Ipv4Addr>()
-        .expect("POWERDNS address must be IPv4")
-        .octets()
+fn parse_ipv4_list(s: &str) -> Vec<[u8; 4]> {
+    let ips: Vec<[u8; 4]> = s
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            p.parse::<Ipv4Addr>()
+                .unwrap_or_else(|_| panic!("POWERDNS address must be IPv4: {p}"))
+                .octets()
+        })
+        .collect();
+    assert!(
+        !ips.is_empty(),
+        "ISUCON13_POWERDNS_SUBDOMAIN_ADDRESS must list at least one IPv4"
+    );
+    ips
 }
 
 #[tokio::main]
@@ -31,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let powerdns_addr = std::env::var("ISUCON13_POWERDNS_SUBDOMAIN_ADDRESS")
         .expect("environ ISUCON13_POWERDNS_SUBDOMAIN_ADDRESS must be provided");
-    let ipv4 = parse_ipv4(&powerdns_addr);
+    let ipv4s = parse_ipv4_list(&powerdns_addr);
 
     let (fallback_image, fallback_hash) = isupipe::store::load_fallback_image().unwrap_or_else(|e| {
         tracing::warn!("failed to read {FALLBACK_IMAGE_PATH}: {e}");
@@ -44,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fallback_hash: fallback_hash.clone(),
             ..Store::default()
         }),
+        rank: Mutex::new(RankState::default()),
         shards: Inner::empty_shards(),
         dns_names: dns_names.clone(),
         pool,
@@ -55,12 +67,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_reaction_id: AtomicI64::new(1),
         next_ng_word_id: AtomicI64::new(1),
         next_report_id: AtomicI64::new(1),
+        total_tip: AtomicI64::new(0),
     });
 
     handlers::reload_on_boot(&inner).await;
     *dns_names.write() = rebuild_dns_names(&inner.store.read());
 
-    dns::start(dns_names, ipv4);
+    dns::start(dns_names, ipv4s);
 
     let state = AppState { inner };
     let sock_path = std::env::var("ISUCON13_HTTP_SOCK")
@@ -79,6 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     tracing::info!("unix socket {sock_path}");
+
+    tokio::spawn(isupipe::pprof::serve());
 
     let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 8080))).await?;
     tracing::info!("listening on 0.0.0.0:8080 (custom HTTP/1.1)");
