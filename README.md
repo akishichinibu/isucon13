@@ -21,13 +21,16 @@ HTTPS `https://pipe.u.isucon.dev` via PowerDNS on `.214`. Language: Go.
 | `main` initial Go reference | pass | **4688** |
 | `feat/go-opt` indexes + icon_hash + stats + DNS cache | pass | **38212** |
 | `feat/rust` in-memory + UDP/53 | pass | **190642** (DNS 206048/0, viewers 982) |
+| `feat/rust` 3-tier + custom HTTP | pass | **261037** (DNS 199711/0, viewers 1331) |
 
 Winner NaruseJun 468006. Score is total tips (ISUCOIN).
 
 ```bash
-bash scripts/deploy.sh
+bash scripts/deploy-cluster.sh
 bash scripts/run-bench.sh
 ```
+
+Cluster: `.214` nginx TLS, `.215` rust+DNS, `.216` MySQL. Bench nameserver is `.215`; A records point at `.214`.
 
 ## Layout
 

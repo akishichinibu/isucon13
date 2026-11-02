@@ -10,9 +10,6 @@ codegen-units = 1
 opt-level = 3
 
 [dependencies]
-async-session = "3"
-axum = { version = "0.6", features = ["headers"] }
-axum-extra = { version = "0.8", features = ["cookie-signed", "cookie-key-expansion"] }
 base64 = "0.21"
 bcrypt = "0.15"
 bytes = "1"
@@ -23,8 +20,7 @@ sha2 = "0.10"
 socket2 = { version = "0.5", features = ["all"] }
 sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio", "mysql", "macros"] }
 thiserror = "1"
-time = "0.3.36"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "net", "io-util", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
