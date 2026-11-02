@@ -6,7 +6,8 @@ HOSTS=(192.168.0.214 192.168.0.215 192.168.0.216)
 SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 RSYNC=(rsync -az --delete -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new")
 
-export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}"
+# ubuntu-dev is i5-13600T; t5820 guests are Xeon W-2145. Do not use target-cpu=native.
+export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=skylake}"
 echo "==== cargo build --release (ubuntu-dev) ===="
 (cd "$ROOT/webapp/rust" && cargo build --release --locked)
 BIN="$ROOT/webapp/rust/target/release/isupipe"
