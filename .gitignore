@@ -1,0 +1,4 @@
+webapp/go/isupipe
+webapp/rust/target/
+**/*.log
+.DS_Store
