@@ -6,11 +6,12 @@ HOSTS=(192.168.0.214 192.168.0.215 192.168.0.216)
 SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 RSYNC=(rsync -az --delete -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new")
 
-# ubuntu-dev is i5-13600T; t5820 guests are Xeon W-2145. Do not use target-cpu=native.
+# ubuntu-dev is Ubuntu 24.04 (glibc 2.39); guests are jammy (2.35).
+# Static musl binary plus Skylake CPU (W-2145), not the i5-13600T host.
 export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=skylake}"
-echo "==== cargo build --release (ubuntu-dev) ===="
-(cd "$ROOT/webapp/rust" && cargo build --release --locked)
-BIN="$ROOT/webapp/rust/target/release/isupipe"
+echo "==== cargo build --release --target x86_64-unknown-linux-musl ===="
+(cd "$ROOT/webapp/rust" && cargo build --release --locked --target x86_64-unknown-linux-musl)
+BIN="$ROOT/webapp/rust/target/x86_64-unknown-linux-musl/release/isupipe"
 test -x "$BIN"
 
 for ip in "${HOSTS[@]}"; do
