@@ -90,18 +90,20 @@ pub fn reserve(state: &AppState, cookie: Option<&str>, body: &[u8]) -> Result<Ht
         return Err(Error::bad("bad reservation time range"));
     }
     let mut store = state.inner.store.write();
-    for slot in store.slots.iter() {
-        if slot.start_at >= req.start_at && slot.end_at <= req.end_at && slot.slot < 1 {
-            return Err(Error::bad(format!(
-                "予約期間 {TERM_START_AT} ~ {TERM_END_AT}に対して、予約区間 {} ~ {}が予約できません",
-                req.start_at, req.end_at
-            )));
-        }
+    let start = req.start_at;
+    let end = req.end_at;
+    let lo = store
+        .slots
+        .partition_point(|s| s.start_at < start);
+    let hi = lo + store.slots[lo..].partition_point(|s| s.end_at <= end);
+    if store.slots[lo..hi].iter().any(|s| s.slot < 1) {
+        return Err(Error::bad(format!(
+            "予約期間 {TERM_START_AT} ~ {TERM_END_AT}に対して、予約区間 {} ~ {}が予約できません",
+            start, end
+        )));
     }
-    for slot in store.slots.iter_mut() {
-        if slot.start_at >= req.start_at && slot.end_at <= req.end_at {
-            slot.slot -= 1;
-        }
+    for slot in &mut store.slots[lo..hi] {
+        slot.slot -= 1;
     }
     let livestream_id = store.next_livestream_id;
     store.next_livestream_id += 1;
@@ -136,7 +138,11 @@ pub fn reserve(state: &AppState, cookie: Option<&str>, body: &[u8]) -> Result<Ht
     if let Some(user) = store.users.get_mut(&auth.user_id) {
         user.livestream_ids.push(livestream_id);
     }
-    let livestream = store
+    drop(store);
+    let livestream = state
+        .inner
+        .store
+        .read()
         .fill_livestream(livestream_id)
         .ok_or_else(|| Error::internal("failed to fill livestream"))?;
     json_created(&livestream)
@@ -323,12 +329,28 @@ pub fn get_livecomments(
         Some(n) => iter.take(n).collect(),
         None => iter.collect(),
     };
+    let livestream = store
+        .fill_livestream(livestream_id)
+        .ok_or_else(|| Error::internal("failed to fil livecomments"))?;
     let mut out = Vec::with_capacity(chosen.len());
     for id in chosen {
         let c = store
-            .fill_livecomment(id)
+            .comments
+            .get(&id)
             .ok_or_else(|| Error::internal("failed to fil livecomments"))?;
-        out.push(c);
+        let user = store
+            .users
+            .get(&c.user_id)
+            .ok_or_else(|| Error::internal("failed to fil livecomments"))?
+            .to_public();
+        out.push(store::Livecomment {
+            id: c.id,
+            user,
+            livestream: livestream.clone(),
+            comment: c.comment.clone(),
+            tip: c.tip,
+            created_at: c.created_at,
+        });
     }
     json_ok(&out)
 }
@@ -404,7 +426,11 @@ pub fn post_livecomment(
         .or_default()
         .push(id);
     store.add_comment_stats(livestream_id, req.tip);
-    let livecomment = store
+    drop(store);
+    let livecomment = state
+        .inner
+        .store
+        .read()
         .fill_livecomment(id)
         .ok_or_else(|| Error::internal("failed to fill livecomment"))?;
     json_created(&livecomment)
@@ -516,12 +542,27 @@ pub fn get_reactions(
         Some(n) => iter.take(n).collect(),
         None => iter.collect(),
     };
+    let livestream = store
+        .fill_livestream(livestream_id)
+        .ok_or_else(|| Error::internal("failed to fill reaction"))?;
     let mut out = Vec::with_capacity(chosen.len());
     for id in chosen {
         let r = store
-            .fill_reaction(id)
+            .reactions
+            .get(&id)
             .ok_or_else(|| Error::internal("failed to fill reaction"))?;
-        out.push(r);
+        let user = store
+            .users
+            .get(&r.user_id)
+            .ok_or_else(|| Error::internal("failed to fill reaction"))?
+            .to_public();
+        out.push(store::Reaction {
+            id: r.id,
+            emoji_name: r.emoji_name.clone(),
+            user,
+            livestream: livestream.clone(),
+            created_at: r.created_at,
+        });
     }
     json_ok(&out)
 }
@@ -559,7 +600,11 @@ pub fn post_reaction(
         .or_default()
         .push(id);
     store.add_reaction_stats(livestream_id, &req.emoji_name);
-    let reaction = store
+    drop(store);
+    let reaction = state
+        .inner
+        .store
+        .read()
         .fill_reaction(id)
         .ok_or_else(|| Error::internal("failed to fill reaction"))?;
     json_created(&reaction)

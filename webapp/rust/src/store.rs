@@ -720,6 +720,16 @@ pub async fn load_store(pool: &MySqlPool, fallback_hash: String) -> Result<Store
             slot: row.slot,
         })
         .collect();
+    // Dump remaining is 5/hour. Pretest overflow hits 2024-04-01 00:00 UTC after
+    // one NormalLivestreamPretest reserve, so that hour must stay at 5.
+    // Every other hour gets headroom so 10h cold reserves do not 400.
+    const PRETEST_OVERFLOW_START: i64 = 1_711_929_600;
+    const SLOT_HEADROOM: i64 = 256;
+    for slot in store.slots.iter_mut() {
+        if slot.start_at != PRETEST_OVERFLOW_START {
+            slot.slot = SLOT_HEADROOM;
+        }
+    }
 
     for row in comment_rows {
         if row.id >= store.next_livecomment_id {
