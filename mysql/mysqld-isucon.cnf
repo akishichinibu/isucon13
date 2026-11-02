@@ -14,7 +14,7 @@ sync_binlog = 0
 
 innodb_redo_log_capacity = 256M
 
-skip_name_resolve
+# Keep reverse DNS so PowerDNS gmysql-host=127.0.0.1 still matches isudns@localhost.
 max_connections = 500
 thread_cache_size = 64
 
