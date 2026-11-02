@@ -68,6 +68,10 @@ mysql -u"$ISUCON_DB_USER" \
 		--port "$ISUCON_DB_PORT" \
 		"$ISUCON_DB_NAME" < initial_livecomments.sql
 
-bash ../pdns/init_zone.sh 
+if [ "${ISUCON13_SKIP_PDNS:-0}" = "1" ]; then
+	echo "skip pdns init_zone.sh (in-process DNS)"
+else
+	bash ../pdns/init_zone.sh
+fi 
 
 
