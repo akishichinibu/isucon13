@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use bytes::Bytes;
@@ -195,15 +195,14 @@ pub struct SlotRec {
     pub slot: i64,
 }
 
+pub const SHARDS: usize = 32;
+
+pub fn shard_idx(livestream_id: i64) -> usize {
+    (livestream_id as u64 % SHARDS as u64) as usize
+}
+
 #[derive(Debug, Default)]
-pub struct Store {
-    pub users: HashMap<i64, UserRec>,
-    pub users_by_name: HashMap<String, i64>,
-    pub livestreams: HashMap<i64, LivestreamRec>,
-    pub tags: HashMap<i64, Tag>,
-    pub tags_by_name: HashMap<String, i64>,
-    pub tag_order: Vec<i64>,
-    pub livestreams_by_tag: HashMap<i64, Vec<i64>>,
+pub struct LsShard {
     pub comments: HashMap<i64, LivecommentRec>,
     pub comments_by_ls: HashMap<i64, Vec<i64>>,
     pub reactions: HashMap<i64, ReactionRec>,
@@ -213,6 +212,65 @@ pub struct Store {
     pub reports: HashMap<i64, ReportRec>,
     pub reports_by_ls: HashMap<i64, Vec<i64>>,
     pub viewers_by_ls: HashMap<i64, Vec<ViewerRec>>,
+}
+
+impl LsShard {
+    pub fn max_tip(&self, livestream_id: i64) -> i64 {
+        self.comments_by_ls
+            .get(&livestream_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.comments.get(id).map(|c| c.tip))
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn moderate(&mut self, livestream_id: i64) -> Vec<i64> {
+        let words: Vec<String> = self
+            .ng_by_ls
+            .get(&livestream_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.ng_words.get(id).map(|w| w.word.clone()))
+            .collect();
+        if words.is_empty() {
+            return Vec::new();
+        }
+        let ids = self
+            .comments_by_ls
+            .get(&livestream_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut keep = Vec::with_capacity(ids.len());
+        let mut removed_tips = Vec::new();
+        for id in ids {
+            let hit = self
+                .comments
+                .get(&id)
+                .map(|c| words.iter().any(|w| c.comment.contains(w.as_str())))
+                .unwrap_or(false);
+            if hit {
+                if let Some(c) = self.comments.remove(&id) {
+                    removed_tips.push(c.tip);
+                }
+            } else {
+                keep.push(id);
+            }
+        }
+        self.comments_by_ls.insert(livestream_id, keep);
+        removed_tips
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Store {
+    pub users: HashMap<i64, UserRec>,
+    pub users_by_name: HashMap<String, i64>,
+    pub livestreams: HashMap<i64, LivestreamRec>,
+    pub tags: HashMap<i64, Tag>,
+    pub tags_by_name: HashMap<String, i64>,
+    pub tag_order: Vec<i64>,
+    pub livestreams_by_tag: HashMap<i64, Vec<i64>>,
     pub slots: Vec<SlotRec>,
     pub total_tip: i64,
     pub next_user_id: i64,
@@ -223,12 +281,15 @@ pub struct Store {
     pub next_reaction_id: i64,
     pub next_ng_word_id: i64,
     pub next_report_id: i64,
+    pub cached_public: HashMap<i64, Livestream>,
+    pub ls_rank_index: BTreeSet<(i64, i64)>,
+    pub user_rank_index: BTreeSet<(i64, String)>,
     #[allow(dead_code)]
     pub fallback_hash: String,
 }
 
 impl Store {
-    pub fn fill_livestream(&self, id: i64) -> Option<Livestream> {
+    fn build_livestream(&self, id: i64) -> Option<Livestream> {
         let ls = self.livestreams.get(&id)?;
         let owner = self.users.get(&ls.user_id)?.to_public();
         let tags = ls
@@ -249,127 +310,130 @@ impl Store {
         })
     }
 
-    pub fn fill_livecomment(&self, id: i64) -> Option<Livecomment> {
-        let c = self.comments.get(&id)?;
-        let user = self.users.get(&c.user_id)?.to_public();
-        let livestream = self.fill_livestream(c.livestream_id)?;
-        Some(Livecomment {
-            id: c.id,
-            user,
-            livestream,
-            comment: c.comment.clone(),
-            tip: c.tip,
-            created_at: c.created_at,
-        })
+    pub fn fill_livestream(&self, id: i64) -> Option<Livestream> {
+        if let Some(cached) = self.cached_public.get(&id) {
+            return Some(cached.clone());
+        }
+        self.build_livestream(id)
     }
 
-    pub fn fill_reaction(&self, id: i64) -> Option<Reaction> {
-        let r = self.reactions.get(&id)?;
-        let user = self.users.get(&r.user_id)?.to_public();
-        let livestream = self.fill_livestream(r.livestream_id)?;
-        Some(Reaction {
-            id: r.id,
-            emoji_name: r.emoji_name.clone(),
-            user,
-            livestream,
-            created_at: r.created_at,
-        })
+    pub fn cache_livestream(&mut self, id: i64) {
+        if let Some(ls) = self.build_livestream(id) {
+            self.cached_public.insert(id, ls);
+        }
     }
 
-    pub fn fill_report(&self, id: i64) -> Option<LivecommentReport> {
-        let r = self.reports.get(&id)?;
-        let reporter = self.users.get(&r.user_id)?.to_public();
-        let livecomment = self.fill_livecomment(r.livecomment_id)?;
-        Some(LivecommentReport {
-            id: r.id,
-            reporter,
-            livecomment,
-            created_at: r.created_at,
-        })
+    pub fn invalidate_owner_cache(&mut self, user_id: i64) {
+        let ids = self
+            .users
+            .get(&user_id)
+            .map(|u| u.livestream_ids.clone())
+            .unwrap_or_default();
+        for id in ids {
+            self.cache_livestream(id);
+        }
     }
 
     pub fn user_rank(&self, username: &str) -> Option<i64> {
         let user_id = *self.users_by_name.get(username)?;
         let user = self.users.get(&user_id)?;
         let score = user.score();
-        let mut rank = 1i64;
-        for u in self.users.values() {
-            let s = u.score();
-            if s > score || (s == score && u.name.as_str() > username) {
-                rank += 1;
-            }
-        }
-        Some(rank)
+        let better = self
+            .user_rank_index
+            .range((std::ops::Bound::Excluded((score, username.to_string())), std::ops::Bound::Unbounded))
+            .count();
+        Some(better as i64 + 1)
     }
 
     pub fn livestream_rank(&self, livestream_id: i64) -> Option<i64> {
         let ls = self.livestreams.get(&livestream_id)?;
         let score = ls.score();
-        let mut rank = 1i64;
-        for other in self.livestreams.values() {
-            let s = other.score();
-            if s > score || (s == score && other.id > livestream_id) {
-                rank += 1;
-            }
+        let better = self
+            .ls_rank_index
+            .range((score, livestream_id + 1)..)
+            .count();
+        Some(better as i64 + 1)
+    }
+
+    fn retune_ls_rank(&mut self, livestream_id: i64, old_score: i64) {
+        self.ls_rank_index.remove(&(old_score, livestream_id));
+        if let Some(ls) = self.livestreams.get(&livestream_id) {
+            self.ls_rank_index.insert((ls.score(), livestream_id));
         }
-        Some(rank)
+    }
+
+    fn retune_user_rank(&mut self, user_id: i64, old_score: i64, name: &str) {
+        self.user_rank_index.remove(&(old_score, name.to_string()));
+        if let Some(user) = self.users.get(&user_id) {
+            self.user_rank_index.insert((user.score(), user.name.clone()));
+        }
     }
 
     pub fn add_comment_stats(&mut self, livestream_id: i64, tip: i64) {
         self.total_tip += tip;
         let owner_id = self.livestreams.get(&livestream_id).map(|ls| ls.user_id);
+        let old_ls = self.livestreams.get(&livestream_id).map(|ls| ls.score()).unwrap_or(0);
+        let old_user = owner_id.and_then(|id| {
+            self.users.get(&id).map(|u| (u.score(), u.name.clone()))
+        });
         if let Some(ls) = self.livestreams.get_mut(&livestream_id) {
             ls.tip_sum += tip;
             if tip > ls.max_tip {
                 ls.max_tip = tip;
             }
         }
+        self.retune_ls_rank(livestream_id, old_ls);
         if let Some(owner_id) = owner_id {
             if let Some(owner) = self.users.get_mut(&owner_id) {
                 owner.tip_sum += tip;
                 owner.livecomment_count += 1;
             }
+            if let Some((old_score, name)) = old_user {
+                self.retune_user_rank(owner_id, old_score, &name);
+            }
         }
     }
 
-    pub fn remove_comment_stats(&mut self, livestream_id: i64, tip: i64) {
+    pub fn remove_comment_stats(&mut self, livestream_id: i64, tip: i64, new_max_tip: i64) {
         self.total_tip -= tip;
         let owner_id = self.livestreams.get(&livestream_id).map(|ls| ls.user_id);
+        let old_ls = self.livestreams.get(&livestream_id).map(|ls| ls.score()).unwrap_or(0);
+        let old_user = owner_id.and_then(|id| {
+            self.users.get(&id).map(|u| (u.score(), u.name.clone()))
+        });
         if let Some(ls) = self.livestreams.get_mut(&livestream_id) {
             ls.tip_sum -= tip;
+            ls.max_tip = new_max_tip;
         }
+        self.retune_ls_rank(livestream_id, old_ls);
         if let Some(owner_id) = owner_id {
             if let Some(owner) = self.users.get_mut(&owner_id) {
                 owner.tip_sum -= tip;
                 owner.livecomment_count -= 1;
             }
-        }
-        self.recompute_max_tip(livestream_id);
-    }
-
-    pub fn recompute_max_tip(&mut self, livestream_id: i64) {
-        let max = self
-            .comments_by_ls
-            .get(&livestream_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|id| self.comments.get(id).map(|c| c.tip))
-            .max()
-            .unwrap_or(0);
-        if let Some(ls) = self.livestreams.get_mut(&livestream_id) {
-            ls.max_tip = max;
+            if let Some((old_score, name)) = old_user {
+                self.retune_user_rank(owner_id, old_score, &name);
+            }
         }
     }
 
     pub fn add_reaction_stats(&mut self, livestream_id: i64, emoji: &str) {
         let owner_id = self.livestreams.get(&livestream_id).map(|ls| ls.user_id);
+        let old_ls = self.livestreams.get(&livestream_id).map(|ls| ls.score()).unwrap_or(0);
+        let old_user = owner_id.and_then(|id| {
+            self.users.get(&id).map(|u| (u.score(), u.name.clone()))
+        });
         if let Some(ls) = self.livestreams.get_mut(&livestream_id) {
             ls.reaction_count += 1;
         }
+        self.retune_ls_rank(livestream_id, old_ls);
         if let Some(owner_id) = owner_id {
             if let Some(owner) = self.users.get_mut(&owner_id) {
                 owner.reaction_count += 1;
                 *owner.emoji_counts.entry(emoji.to_string()).or_insert(0) += 1;
+            }
+            if let Some((old_score, name)) = old_user {
+                self.retune_user_rank(owner_id, old_score, &name);
             }
         }
     }
@@ -386,41 +450,14 @@ impl Store {
         }
     }
 
-    pub fn moderate_livestream(&mut self, livestream_id: i64) {
-        let words: Vec<String> = self
-            .ng_by_ls
-            .get(&livestream_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|id| self.ng_words.get(id).map(|w| w.word.clone()))
-            .collect();
-        if words.is_empty() {
-            return;
+    pub fn rebuild_rank_indexes(&mut self) {
+        self.ls_rank_index.clear();
+        for ls in self.livestreams.values() {
+            self.ls_rank_index.insert((ls.score(), ls.id));
         }
-        let ids = self
-            .comments_by_ls
-            .get(&livestream_id)
-            .cloned()
-            .unwrap_or_default();
-        let mut keep = Vec::with_capacity(ids.len());
-        let mut removed: Vec<(i64, i64)> = Vec::new();
-        for id in ids {
-            let hit = self
-                .comments
-                .get(&id)
-                .map(|c| words.iter().any(|w| c.comment.contains(w.as_str())))
-                .unwrap_or(false);
-            if hit {
-                if let Some(c) = self.comments.get(&id) {
-                    removed.push((id, c.tip));
-                }
-            } else {
-                keep.push(id);
-            }
-        }
-        self.comments_by_ls.insert(livestream_id, keep);
-        for (_id, tip) in removed {
-            self.remove_comment_stats(livestream_id, tip);
+        self.user_rank_index.clear();
+        for user in self.users.values() {
+            self.user_rank_index.insert((user.score(), user.name.clone()));
         }
     }
 }
@@ -534,7 +571,10 @@ pub fn load_fallback_image() -> Result<(Bytes, String), std::io::Error> {
     Ok((Bytes::from(bytes), hash))
 }
 
-pub async fn load_store(pool: &MySqlPool, fallback_hash: String) -> Result<Store, sqlx::Error> {
+pub async fn load_store(
+    pool: &MySqlPool,
+    fallback_hash: String,
+) -> Result<(Store, Vec<LsShard>), sqlx::Error> {
     let user_rows: Vec<UserRow> =
         sqlx::query_as("SELECT id, name, display_name, description, password FROM users")
             .fetch_all(pool)
@@ -731,16 +771,19 @@ pub async fn load_store(pool: &MySqlPool, fallback_hash: String) -> Result<Store
         }
     }
 
+    let mut shards: Vec<LsShard> = (0..SHARDS).map(|_| LsShard::default()).collect();
+
     for row in comment_rows {
         if row.id >= store.next_livecomment_id {
             store.next_livecomment_id = row.id + 1;
         }
-        store
+        let shard = &mut shards[shard_idx(row.livestream_id)];
+        shard
             .comments_by_ls
             .entry(row.livestream_id)
             .or_default()
             .push(row.id);
-        store.comments.insert(
+        shard.comments.insert(
             row.id,
             LivecommentRec {
                 id: row.id,
@@ -752,28 +795,31 @@ pub async fn load_store(pool: &MySqlPool, fallback_hash: String) -> Result<Store
             },
         );
     }
-    let mut comments_by_ls = std::mem::take(&mut store.comments_by_ls);
-    for ids in comments_by_ls.values_mut() {
-        ids.sort_by_key(|id| {
-            store
-                .comments
-                .get(id)
-                .map(|c| (c.created_at, c.id))
-                .unwrap_or((0, 0))
-        });
+    for shard in shards.iter_mut() {
+        let mut by_ls = std::mem::take(&mut shard.comments_by_ls);
+        for ids in by_ls.values_mut() {
+            ids.sort_by_key(|id| {
+                shard
+                    .comments
+                    .get(id)
+                    .map(|c| (c.created_at, c.id))
+                    .unwrap_or((0, 0))
+            });
+        }
+        shard.comments_by_ls = by_ls;
     }
-    store.comments_by_ls = comments_by_ls;
 
     for row in reaction_rows {
         if row.id >= store.next_reaction_id {
             store.next_reaction_id = row.id + 1;
         }
-        store
+        let shard = &mut shards[shard_idx(row.livestream_id)];
+        shard
             .reactions_by_ls
             .entry(row.livestream_id)
             .or_default()
             .push(row.id);
-        store.reactions.insert(
+        shard.reactions.insert(
             row.id,
             ReactionRec {
                 id: row.id,
@@ -784,28 +830,31 @@ pub async fn load_store(pool: &MySqlPool, fallback_hash: String) -> Result<Store
             },
         );
     }
-    let mut reactions_by_ls = std::mem::take(&mut store.reactions_by_ls);
-    for ids in reactions_by_ls.values_mut() {
-        ids.sort_by_key(|id| {
-            store
-                .reactions
-                .get(id)
-                .map(|r| (r.created_at, r.id))
-                .unwrap_or((0, 0))
-        });
+    for shard in shards.iter_mut() {
+        let mut by_ls = std::mem::take(&mut shard.reactions_by_ls);
+        for ids in by_ls.values_mut() {
+            ids.sort_by_key(|id| {
+                shard
+                    .reactions
+                    .get(id)
+                    .map(|r| (r.created_at, r.id))
+                    .unwrap_or((0, 0))
+            });
+        }
+        shard.reactions_by_ls = by_ls;
     }
-    store.reactions_by_ls = reactions_by_ls;
 
     for row in ng_rows {
         if row.id >= store.next_ng_word_id {
             store.next_ng_word_id = row.id + 1;
         }
-        store
+        let shard = &mut shards[shard_idx(row.livestream_id)];
+        shard
             .ng_by_ls
             .entry(row.livestream_id)
             .or_default()
             .push(row.id);
-        store.ng_words.insert(
+        shard.ng_words.insert(
             row.id,
             NgWord {
                 id: row.id,
@@ -816,31 +865,21 @@ pub async fn load_store(pool: &MySqlPool, fallback_hash: String) -> Result<Store
             },
         );
     }
-    let mut ng_by_ls = std::mem::take(&mut store.ng_by_ls);
-    for ids in ng_by_ls.values_mut() {
-        ids.sort_by_key(|id| {
-            store
-                .ng_words
-                .get(id)
-                .map(|w| (w.created_at, w.id))
-                .unwrap_or((0, 0))
-        });
-    }
-    store.ng_by_ls = ng_by_ls;
 
     for row in report_rows {
         if row.id >= store.next_report_id {
             store.next_report_id = row.id + 1;
         }
-        store
+        if let Some(ls) = store.livestreams.get_mut(&row.livestream_id) {
+            ls.reports_count += 1;
+        }
+        let shard = &mut shards[shard_idx(row.livestream_id)];
+        shard
             .reports_by_ls
             .entry(row.livestream_id)
             .or_default()
             .push(row.id);
-        if let Some(ls) = store.livestreams.get_mut(&row.livestream_id) {
-            ls.reports_count += 1;
-        }
-        store.reports.insert(
+        shard.reports.insert(
             row.id,
             ReportRec {
                 id: row.id,
@@ -853,7 +892,7 @@ pub async fn load_store(pool: &MySqlPool, fallback_hash: String) -> Result<Store
     }
 
     for row in viewer_rows {
-        store
+        shards[shard_idx(row.livestream_id)]
             .viewers_by_ls
             .entry(row.livestream_id)
             .or_default()
@@ -864,25 +903,32 @@ pub async fn load_store(pool: &MySqlPool, fallback_hash: String) -> Result<Store
         store.add_viewer_stats(row.livestream_id, 1);
     }
 
-    // Rebuild livestream/user counters from comments and reactions.
-    let comment_stats: Vec<(i64, i64)> = store
-        .comments
-        .values()
-        .map(|c| (c.livestream_id, c.tip))
+    let comment_stats: Vec<(i64, i64)> = shards
+        .iter()
+        .flat_map(|s| s.comments.values().map(|c| (c.livestream_id, c.tip)))
         .collect();
     for (livestream_id, tip) in comment_stats {
         store.add_comment_stats(livestream_id, tip);
     }
-    let reaction_stats: Vec<(i64, String)> = store
-        .reactions
-        .values()
-        .map(|r| (r.livestream_id, r.emoji_name.clone()))
+    let reaction_stats: Vec<(i64, String)> = shards
+        .iter()
+        .flat_map(|s| {
+            s.reactions
+                .values()
+                .map(|r| (r.livestream_id, r.emoji_name.clone()))
+        })
         .collect();
     for (livestream_id, emoji) in reaction_stats {
         store.add_reaction_stats(livestream_id, &emoji);
     }
 
-    Ok(store)
+    store.rebuild_rank_indexes();
+    let ls_ids: Vec<i64> = store.livestreams.keys().copied().collect();
+    for id in ls_ids {
+        store.cache_livestream(id);
+    }
+
+    Ok((store, shards))
 }
 
 pub fn parse_zone_names(path: &Path) -> std::io::Result<Vec<String>> {

@@ -4,13 +4,14 @@ pub mod http;
 pub mod store;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
 use sqlx::MySqlPool;
-use store::Store;
+use store::{LsShard, Store, SHARDS};
 
 pub const SESSION_COOKIE: &str = "SESSIONID";
 pub const BCRYPT_COST: u32 = 4;
@@ -54,12 +55,29 @@ pub struct SessionRec {
 
 pub struct Inner {
     pub store: RwLock<Store>,
+    pub shards: Vec<RwLock<LsShard>>,
     pub dns_names: Arc<RwLock<HashSet<String>>>,
     pub pool: MySqlPool,
     pub fallback_image: Bytes,
     pub fallback_hash: String,
     pub init_lock: tokio::sync::Mutex<()>,
     pub sessions: RwLock<HashMap<String, SessionRec>>,
+    pub next_livecomment_id: AtomicI64,
+    pub next_reaction_id: AtomicI64,
+    pub next_ng_word_id: AtomicI64,
+    pub next_report_id: AtomicI64,
+}
+
+impl Inner {
+    pub fn empty_shards() -> Vec<RwLock<LsShard>> {
+        (0..SHARDS).map(|_| RwLock::new(LsShard::default())).collect()
+    }
+
+    pub fn install_shards(&self, shards: Vec<LsShard>) {
+        for (i, shard) in shards.into_iter().enumerate() {
+            *self.shards[i].write() = shard;
+        }
+    }
 }
 
 #[derive(Clone)]

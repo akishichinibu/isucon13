@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixListener};
 
 use crate::{handlers, AppState, Error};
 
@@ -516,6 +516,23 @@ pub async fn serve(listener: TcpListener, state: AppState) -> std::io::Result<()
             }
             Err(err) => {
                 tracing::error!("accept: {err}");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+}
+
+pub async fn serve_unix(listener: UnixListener, state: AppState) -> std::io::Result<()> {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    handle_conn(stream, state).await;
+                });
+            }
+            Err(err) => {
+                tracing::error!("unix accept: {err}");
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }

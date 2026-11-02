@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 60s ISUCON13 load. Bench talks DNS to isucon13-1 then HTTPS to resolved A.
 set -euo pipefail
-# Nameserver is the rust box (.215). A records point at nginx (.214).
+# Nameserver is rust+DNS on .215. A records point at nginx on .214.
 NS="${NS:-192.168.0.215}"
 BENCH="${BENCH:-192.168.0.217}"
 EDGE="${EDGE:-192.168.0.214}"

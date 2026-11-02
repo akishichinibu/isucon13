@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# .214 nginx TLS + static (edge, A-record target)
+# .214 nginx TLS + static (A-record target)
 # .215 rust app + in-process UDP/53 (bench nameserver)
 # .216 MySQL only
+# Colocating rust+nginx on the 2c/4g edge box lost ~50k vs this split.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
@@ -67,8 +68,6 @@ systemctl disable --now isupipe-go pdns mysql || true
 systemctl enable --now isupipe-rust
 systemctl restart isupipe-rust
 systemctl is-active isupipe-rust
-ss -ulnp | grep ':53' || true
-ss -tlnp | grep ':8080' || true
 EOF
 
 echo "==== nginx edge 192.168.0.214 ===="
@@ -78,13 +77,14 @@ scp -o BatchMode=yes "$ROOT/nginx/isupipe.conf" ubuntu@192.168.0.214:/tmp/isupip
 set -euo pipefail
 rsync -a --delete /tmp/isupipe-public/ /home/isucon/webapp/public/
 chown -R isucon:isucon /home/isucon/webapp/public
+systemctl disable --now isupipe-rust isupipe-go pdns mysql || true
 install -m 0644 /tmp/isupipe.conf /etc/nginx/sites-enabled/isupipe.conf
 sed -i 's/worker_connections [0-9]\+/worker_connections 4096/' /etc/nginx/nginx.conf || true
 nginx -t
 systemctl reload nginx
-systemctl disable --now isupipe-rust isupipe-go pdns mysql || true
 systemctl is-active nginx
 EOF
 
 echo "cluster deploy done"
 echo "nameserver=.215  A=.214  mysql=.216  rust=.215:8080"
+

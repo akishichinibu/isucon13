@@ -1,9 +1,10 @@
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::http::{query_str, HttpResp};
 use crate::store::{
-    now_unix, sha256_hex, LivecommentRec, LivestreamRec, NgWord, ReactionRec, ReportRec, UserRec,
-    ViewerRec, TERM_END_AT, TERM_START_AT, ZONE,
+    now_unix, sha256_hex, shard_idx, LivecommentRec, LivestreamRec, NgWord, ReactionRec, ReportRec,
+    UserRec, ViewerRec, TERM_END_AT, TERM_START_AT, ZONE,
 };
 use crate::{
     create_session, etag_matches, json_bytes, parse_json, rebuild_dns_names, require_auth, AppState,
@@ -12,6 +13,18 @@ use crate::{
 use bytes::Bytes;
 
 use crate::store;
+
+fn install_loaded(inner: &Inner, loaded: store::Store, shards: Vec<store::LsShard>) {
+    inner.next_livecomment_id.store(loaded.next_livecomment_id, Ordering::Relaxed);
+    inner.next_reaction_id.store(loaded.next_reaction_id, Ordering::Relaxed);
+    inner.next_ng_word_id.store(loaded.next_ng_word_id, Ordering::Relaxed);
+    inner.next_report_id.store(loaded.next_report_id, Ordering::Relaxed);
+    let names = rebuild_dns_names(&loaded);
+    *inner.store.write() = loaded;
+    inner.install_shards(shards);
+    *inner.dns_names.write() = names;
+    inner.sessions.write().clear();
+}
 
 fn json_ok<T: serde::Serialize>(v: &T) -> Result<HttpResp, Error> {
     Ok(HttpResp::json(200, json_bytes(v)?))
@@ -36,13 +49,10 @@ pub async fn initialize(state: &AppState) -> Result<HttpResp, Error> {
             String::from_utf8_lossy(&output.stderr),
         )));
     }
-    let loaded = store::load_store(&state.inner.pool, state.inner.fallback_hash.clone())
+    let (loaded, shards) = store::load_store(&state.inner.pool, state.inner.fallback_hash.clone())
         .await
         .map_err(|e| Error::internal(format!("failed to load state: {e}")))?;
-    let names = rebuild_dns_names(&loaded);
-    *state.inner.store.write() = loaded;
-    *state.inner.dns_names.write() = names;
-    state.inner.sessions.write().clear();
+    install_loaded(&state.inner, loaded, shards);
     tracing::info!("initialize loaded in {:?}", started.elapsed());
     json_ok(&serde_json::json!({ "language": "rust" }))
 }
@@ -138,6 +148,8 @@ pub fn reserve(state: &AppState, cookie: Option<&str>, body: &[u8]) -> Result<Ht
     if let Some(user) = store.users.get_mut(&auth.user_id) {
         user.livestream_ids.push(livestream_id);
     }
+    store.ls_rank_index.insert((0, livestream_id));
+    store.cache_livestream(livestream_id);
     drop(store);
     let livestream = state
         .inner
@@ -228,29 +240,39 @@ pub fn user_livestreams(
 
 pub fn enter(state: &AppState, cookie: Option<&str>, livestream_id: i64) -> Result<HttpResp, Error> {
     let auth = require_auth(state, cookie)?;
-    let mut store = state.inner.store.write();
-    store
-        .viewers_by_ls
-        .entry(livestream_id)
-        .or_default()
-        .push(ViewerRec {
-            user_id: auth.user_id,
-            created_at: now_unix(),
-        });
-    store.add_viewer_stats(livestream_id, 1);
+    {
+        let mut shard = state.inner.shards[shard_idx(livestream_id)].write();
+        shard
+            .viewers_by_ls
+            .entry(livestream_id)
+            .or_default()
+            .push(ViewerRec {
+                user_id: auth.user_id,
+                created_at: now_unix(),
+            });
+    }
+    state.inner.store.write().add_viewer_stats(livestream_id, 1);
     Ok(HttpResp::empty(200))
 }
 
 pub fn exit(state: &AppState, cookie: Option<&str>, livestream_id: i64) -> Result<HttpResp, Error> {
     let auth = require_auth(state, cookie)?;
-    let mut store = state.inner.store.write();
-    if let Some(viewers) = store.viewers_by_ls.get_mut(&livestream_id) {
-        let before = viewers.len();
-        viewers.retain(|v| v.user_id != auth.user_id);
-        let removed = (before - viewers.len()) as i64;
-        if removed != 0 {
-            store.add_viewer_stats(livestream_id, -removed);
+    let removed = {
+        let mut shard = state.inner.shards[shard_idx(livestream_id)].write();
+        if let Some(viewers) = shard.viewers_by_ls.get_mut(&livestream_id) {
+            let before = viewers.len();
+            viewers.retain(|v| v.user_id != auth.user_id);
+            (before - viewers.len()) as i64
+        } else {
+            0
         }
+    };
+    if removed != 0 {
+        state
+            .inner
+            .store
+            .write()
+            .add_viewer_stats(livestream_id, -removed);
     }
     Ok(HttpResp::empty(200))
 }
@@ -274,27 +296,61 @@ pub fn get_reports(
     livestream_id: i64,
 ) -> Result<HttpResp, Error> {
     let auth = require_auth(state, cookie)?;
-    let store = state.inner.store.read();
-    let ls = store
-        .livestreams
-        .get(&livestream_id)
-        .ok_or_else(|| Error::internal("failed to get livestream"))?;
-    if ls.user_id != auth.user_id {
-        return Err(Error::forbidden(
-            "can't get other streamer's livecomment reports",
-        ));
+    {
+        let store = state.inner.store.read();
+        let ls = store
+            .livestreams
+            .get(&livestream_id)
+            .ok_or_else(|| Error::internal("failed to get livestream"))?;
+        if ls.user_id != auth.user_id {
+            return Err(Error::forbidden(
+                "can't get other streamer's livecomment reports",
+            ));
+        }
     }
-    let ids = store
+    let shard = state.inner.shards[shard_idx(livestream_id)].read();
+    let ids = shard
         .reports_by_ls
         .get(&livestream_id)
         .cloned()
         .unwrap_or_default();
+    let store = state.inner.store.read();
+    let livestream = store
+        .fill_livestream(livestream_id)
+        .ok_or_else(|| Error::internal("failed to fill livecomment report"))?;
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
-        let report = store
-            .fill_report(id)
+        let r = shard
+            .reports
+            .get(&id)
             .ok_or_else(|| Error::internal("failed to fill livecomment report"))?;
-        out.push(report);
+        let reporter = store
+            .users
+            .get(&r.user_id)
+            .ok_or_else(|| Error::internal("failed to fill livecomment report"))?
+            .to_public();
+        let c = shard
+            .comments
+            .get(&r.livecomment_id)
+            .ok_or_else(|| Error::internal("failed to fill livecomment report"))?;
+        let comment_user = store
+            .users
+            .get(&c.user_id)
+            .ok_or_else(|| Error::internal("failed to fill livecomment report"))?
+            .to_public();
+        out.push(store::LivecommentReport {
+            id: r.id,
+            reporter,
+            livecomment: store::Livecomment {
+                id: c.id,
+                user: comment_user,
+                livestream: livestream.clone(),
+                comment: c.comment.clone(),
+                tip: c.tip,
+                created_at: c.created_at,
+            },
+            created_at: r.created_at,
+        });
     }
     json_ok(&out)
 }
@@ -318,8 +374,8 @@ pub fn get_livecomments(
 ) -> Result<HttpResp, Error> {
     require_auth(state, cookie)?;
     let limit = parse_limit(query)?;
-    let store = state.inner.store.read();
-    let ids = store
+    let shard = state.inner.shards[shard_idx(livestream_id)].read();
+    let ids = shard
         .comments_by_ls
         .get(&livestream_id)
         .cloned()
@@ -329,12 +385,13 @@ pub fn get_livecomments(
         Some(n) => iter.take(n).collect(),
         None => iter.collect(),
     };
+    let store = state.inner.store.read();
     let livestream = store
         .fill_livestream(livestream_id)
         .ok_or_else(|| Error::internal("failed to fil livecomments"))?;
     let mut out = Vec::with_capacity(chosen.len());
     for id in chosen {
-        let c = store
+        let c = shard
             .comments
             .get(&id)
             .ok_or_else(|| Error::internal("failed to fil livecomments"))?;
@@ -361,13 +418,13 @@ pub fn get_ngwords(
     livestream_id: i64,
 ) -> Result<HttpResp, Error> {
     let auth = require_auth(state, cookie)?;
-    let store = state.inner.store.read();
-    let mut words: Vec<NgWord> = store
+    let shard = state.inner.shards[shard_idx(livestream_id)].read();
+    let mut words: Vec<NgWord> = shard
         .ng_by_ls
         .get(&livestream_id)
         .into_iter()
         .flatten()
-        .filter_map(|id| store.ng_words.get(id))
+        .filter_map(|id| shard.ng_words.get(id))
         .filter(|w| w.user_id == auth.user_id)
         .cloned()
         .collect();
@@ -389,51 +446,71 @@ pub fn post_livecomment(
 ) -> Result<HttpResp, Error> {
     let auth = require_auth(state, cookie)?;
     let req: PostLivecommentRequest = parse_json(body)?;
-    let mut store = state.inner.store.write();
-    let ls = store
-        .livestreams
-        .get(&livestream_id)
-        .ok_or_else(|| Error::not_found("livestream not found"))?;
-    let owner_id = ls.user_id;
-    let hit = store
-        .ng_by_ls
-        .get(&livestream_id)
-        .into_iter()
-        .flatten()
-        .filter_map(|id| store.ng_words.get(id))
-        .filter(|w| w.user_id == owner_id)
-        .any(|w| req.comment.contains(&w.word));
-    if hit {
-        return Err(Error::bad("このコメントがスパム判定されました"));
-    }
-    let id = store.next_livecomment_id;
-    store.next_livecomment_id += 1;
+    let owner_id = {
+        let store = state.inner.store.read();
+        store
+            .livestreams
+            .get(&livestream_id)
+            .map(|ls| ls.user_id)
+            .ok_or_else(|| Error::not_found("livestream not found"))?
+    };
+    let id = state
+        .inner
+        .next_livecomment_id
+        .fetch_add(1, Ordering::Relaxed);
     let created_at = now_unix();
-    store.comments.insert(
-        id,
-        LivecommentRec {
+    {
+        let mut shard = state.inner.shards[shard_idx(livestream_id)].write();
+        let hit = shard
+            .ng_by_ls
+            .get(&livestream_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|wid| shard.ng_words.get(wid))
+            .filter(|w| w.user_id == owner_id)
+            .any(|w| req.comment.contains(&w.word));
+        if hit {
+            return Err(Error::bad("このコメントがスパム判定されました"));
+        }
+        shard.comments.insert(
             id,
-            user_id: auth.user_id,
-            livestream_id,
-            comment: req.comment,
-            tip: req.tip,
-            created_at,
-        },
-    );
-    store
-        .comments_by_ls
-        .entry(livestream_id)
-        .or_default()
-        .push(id);
-    store.add_comment_stats(livestream_id, req.tip);
-    drop(store);
-    let livecomment = state
+            LivecommentRec {
+                id,
+                user_id: auth.user_id,
+                livestream_id,
+                comment: req.comment.clone(),
+                tip: req.tip,
+                created_at,
+            },
+        );
+        shard
+            .comments_by_ls
+            .entry(livestream_id)
+            .or_default()
+            .push(id);
+    }
+    state
         .inner
         .store
-        .read()
-        .fill_livecomment(id)
+        .write()
+        .add_comment_stats(livestream_id, req.tip);
+    let store = state.inner.store.read();
+    let user = store
+        .users
+        .get(&auth.user_id)
+        .ok_or_else(|| Error::internal("failed to fill livecomment"))?
+        .to_public();
+    let livestream = store
+        .fill_livestream(livestream_id)
         .ok_or_else(|| Error::internal("failed to fill livecomment"))?;
-    json_created(&livecomment)
+    json_created(&store::Livecomment {
+        id,
+        user,
+        livestream,
+        comment: req.comment,
+        tip: req.tip,
+        created_at,
+    })
 }
 
 pub fn post_report(
@@ -443,38 +520,83 @@ pub fn post_report(
     livecomment_id: i64,
 ) -> Result<HttpResp, Error> {
     let auth = require_auth(state, cookie)?;
-    let mut store = state.inner.store.write();
-    if !store.livestreams.contains_key(&livestream_id) {
+    if !state
+        .inner
+        .store
+        .read()
+        .livestreams
+        .contains_key(&livestream_id)
+    {
         return Err(Error::not_found("livestream not found"));
     }
-    if !store.comments.contains_key(&livecomment_id) {
-        return Err(Error::not_found("livecomment not found"));
-    }
-    let id = store.next_report_id;
-    store.next_report_id += 1;
+    let id = state.inner.next_report_id.fetch_add(1, Ordering::Relaxed);
     let created_at = now_unix();
-    store.reports.insert(
-        id,
-        ReportRec {
+    {
+        let mut shard = state.inner.shards[shard_idx(livestream_id)].write();
+        if !shard.comments.contains_key(&livecomment_id) {
+            return Err(Error::not_found("livecomment not found"));
+        }
+        shard.reports.insert(
             id,
-            user_id: auth.user_id,
-            livestream_id,
-            livecomment_id,
-            created_at,
-        },
-    );
-    store
-        .reports_by_ls
-        .entry(livestream_id)
-        .or_default()
-        .push(id);
-    if let Some(ls) = store.livestreams.get_mut(&livestream_id) {
+            ReportRec {
+                id,
+                user_id: auth.user_id,
+                livestream_id,
+                livecomment_id,
+                created_at,
+            },
+        );
+        shard
+            .reports_by_ls
+            .entry(livestream_id)
+            .or_default()
+            .push(id);
+    }
+    if let Some(ls) = state
+        .inner
+        .store
+        .write()
+        .livestreams
+        .get_mut(&livestream_id)
+    {
         ls.reports_count += 1;
     }
-    let report = store
-        .fill_report(id)
+    let shard = state.inner.shards[shard_idx(livestream_id)].read();
+    let store = state.inner.store.read();
+    let r = shard
+        .reports
+        .get(&id)
         .ok_or_else(|| Error::internal("failed to fill livecomment report"))?;
-    json_created(&report)
+    let reporter = store
+        .users
+        .get(&r.user_id)
+        .ok_or_else(|| Error::internal("failed to fill livecomment report"))?
+        .to_public();
+    let c = shard
+        .comments
+        .get(&livecomment_id)
+        .ok_or_else(|| Error::internal("failed to fill livecomment report"))?;
+    let comment_user = store
+        .users
+        .get(&c.user_id)
+        .ok_or_else(|| Error::internal("failed to fill livecomment report"))?
+        .to_public();
+    let livestream = store
+        .fill_livestream(livestream_id)
+        .ok_or_else(|| Error::internal("failed to fill livecomment report"))?;
+    json_created(&store::LivecommentReport {
+        id,
+        reporter,
+        livecomment: store::Livecomment {
+            id: c.id,
+            user: comment_user,
+            livestream,
+            comment: c.comment.clone(),
+            tip: c.tip,
+            created_at: c.created_at,
+        },
+        created_at,
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -490,8 +612,10 @@ pub fn moderate(
 ) -> Result<HttpResp, Error> {
     let auth = require_auth(state, cookie)?;
     let req: ModerateRequest = parse_json(body)?;
-    let mut store = state.inner.store.write();
-    let owned = store
+    let owned = state
+        .inner
+        .store
+        .read()
         .livestreams
         .get(&livestream_id)
         .map(|ls| ls.user_id == auth.user_id)
@@ -501,25 +625,35 @@ pub fn moderate(
             "A streamer can't moderate livestreams that other streamers own",
         ));
     }
-    let word_id = store.next_ng_word_id;
-    store.next_ng_word_id += 1;
+    let word_id = state.inner.next_ng_word_id.fetch_add(1, Ordering::Relaxed);
     let created_at = now_unix();
-    store.ng_words.insert(
-        word_id,
-        NgWord {
-            id: word_id,
-            user_id: auth.user_id,
-            livestream_id,
-            word: req.ng_word,
-            created_at,
-        },
-    );
-    store
-        .ng_by_ls
-        .entry(livestream_id)
-        .or_default()
-        .push(word_id);
-    store.moderate_livestream(livestream_id);
+    let removed_tips = {
+        let mut shard = state.inner.shards[shard_idx(livestream_id)].write();
+        shard.ng_words.insert(
+            word_id,
+            NgWord {
+                id: word_id,
+                user_id: auth.user_id,
+                livestream_id,
+                word: req.ng_word,
+                created_at,
+            },
+        );
+        shard
+            .ng_by_ls
+            .entry(livestream_id)
+            .or_default()
+            .push(word_id);
+        let tips = shard.moderate(livestream_id);
+        let max_tip = shard.max_tip(livestream_id);
+        (tips, max_tip)
+    };
+    {
+        let mut store = state.inner.store.write();
+        for tip in removed_tips.0 {
+            store.remove_comment_stats(livestream_id, tip, removed_tips.1);
+        }
+    }
     json_created(&serde_json::json!({ "word_id": word_id }))
 }
 
@@ -531,8 +665,8 @@ pub fn get_reactions(
 ) -> Result<HttpResp, Error> {
     require_auth(state, cookie)?;
     let limit = parse_limit(query)?;
-    let store = state.inner.store.read();
-    let ids = store
+    let shard = state.inner.shards[shard_idx(livestream_id)].read();
+    let ids = shard
         .reactions_by_ls
         .get(&livestream_id)
         .cloned()
@@ -542,12 +676,13 @@ pub fn get_reactions(
         Some(n) => iter.take(n).collect(),
         None => iter.collect(),
     };
+    let store = state.inner.store.read();
     let livestream = store
         .fill_livestream(livestream_id)
         .ok_or_else(|| Error::internal("failed to fill reaction"))?;
     let mut out = Vec::with_capacity(chosen.len());
     for id in chosen {
-        let r = store
+        let r = shard
             .reactions
             .get(&id)
             .ok_or_else(|| Error::internal("failed to fill reaction"))?;
@@ -580,34 +715,47 @@ pub fn post_reaction(
 ) -> Result<HttpResp, Error> {
     let auth = require_auth(state, cookie)?;
     let req: PostReactionRequest = parse_json(body)?;
-    let mut store = state.inner.store.write();
-    let id = store.next_reaction_id;
-    store.next_reaction_id += 1;
+    let id = state.inner.next_reaction_id.fetch_add(1, Ordering::Relaxed);
     let created_at = now_unix();
-    store.reactions.insert(
-        id,
-        ReactionRec {
+    {
+        let mut shard = state.inner.shards[shard_idx(livestream_id)].write();
+        shard.reactions.insert(
             id,
-            emoji_name: req.emoji_name.clone(),
-            user_id: auth.user_id,
-            livestream_id,
-            created_at,
-        },
-    );
-    store
-        .reactions_by_ls
-        .entry(livestream_id)
-        .or_default()
-        .push(id);
-    store.add_reaction_stats(livestream_id, &req.emoji_name);
-    drop(store);
-    let reaction = state
+            ReactionRec {
+                id,
+                emoji_name: req.emoji_name.clone(),
+                user_id: auth.user_id,
+                livestream_id,
+                created_at,
+            },
+        );
+        shard
+            .reactions_by_ls
+            .entry(livestream_id)
+            .or_default()
+            .push(id);
+    }
+    state
         .inner
         .store
-        .read()
-        .fill_reaction(id)
+        .write()
+        .add_reaction_stats(livestream_id, &req.emoji_name);
+    let store = state.inner.store.read();
+    let user = store
+        .users
+        .get(&auth.user_id)
+        .ok_or_else(|| Error::internal("failed to fill reaction"))?
+        .to_public();
+    let livestream = store
+        .fill_livestream(livestream_id)
         .ok_or_else(|| Error::internal("failed to fill reaction"))?;
-    json_created(&reaction)
+    json_created(&store::Reaction {
+        id,
+        emoji_name: req.emoji_name,
+        user,
+        livestream,
+        created_at,
+    })
 }
 
 fn from_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -687,6 +835,7 @@ pub fn post_icon(state: &AppState, cookie: Option<&str>, body: &[u8]) -> Result<
     user.icon = Some(Bytes::from(req.image));
     user.icon_hash = hash;
     user.icon_id = icon_id;
+    store.invalidate_owner_cache(auth.user_id);
     json_created(&serde_json::json!({ "id": icon_id }))
 }
 
@@ -737,6 +886,7 @@ pub fn register(state: &AppState, body: &[u8]) -> Result<HttpResp, Error> {
     };
     let public = rec.to_public();
     store.users_by_name.insert(req.name.clone(), user_id);
+    store.user_rank_index.insert((0, req.name.clone()));
     store.users.insert(user_id, rec);
     drop(store);
     state
@@ -842,11 +992,7 @@ pub fn payment(state: &AppState) -> Result<HttpResp, Error> {
 
 pub async fn reload_on_boot(inner: &Inner) {
     match store::load_store(&inner.pool, inner.fallback_hash.clone()).await {
-        Ok(loaded) => {
-            let names = rebuild_dns_names(&loaded);
-            *inner.store.write() = loaded;
-            *inner.dns_names.write() = names;
-        }
+        Ok((loaded, shards)) => install_loaded(inner, loaded, shards),
         Err(err) => {
             tracing::warn!("startup load skipped: {err}");
             *inner.dns_names.write() = rebuild_dns_names(&inner.store.read());
