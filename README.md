@@ -19,6 +19,8 @@ HTTPS `https://pipe.u.isucon.dev` via PowerDNS on `.214`. Language: Go.
 | Tree | Result | Score |
 |------|--------|-------|
 | `main` initial Go reference | pass | **4688** |
+| `feat/go-opt` indexes + icon_hash + stats + DNS cache | pass | **38212** |
+| `feat/rust` in-memory + UDP/53 | pass | **190642** (DNS 206048/0, viewers 982) |
 
 Winner NaruseJun 468006. Score is total tips (ISUCOIN).
 
