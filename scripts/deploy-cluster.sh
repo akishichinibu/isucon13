@@ -1,14 +1,37 @@
 #!/usr/bin/env bash
-# .214 nginx TLS + static (A-record target)
+# Dual TLS: .214 and .216 nginx (A-record targets) -> .215 rust:8080
 # .215 rust app + in-process UDP/53 (bench nameserver)
-# .216 MySQL only
-# Colocating rust+nginx on the 2c/4g edge box lost ~50k vs this split.
+# .216 also keeps MySQL for initialize
+# App stays a single in-memory process. Do not colocate rust with nginx.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 RSYNC=(rsync -az --delete -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new")
 
-export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=skylake}"
+deploy_nginx() {
+  local host=$1
+  echo "==== nginx TLS ${host} ===="
+  "${RSYNC[@]}" "$ROOT/webapp/public/" ubuntu@"$host":/tmp/isupipe-public/
+  scp -o BatchMode=yes "$ROOT/nginx/isupipe.conf" ubuntu@"$host":/tmp/isupipe.conf
+  "${SSH[@]}" ubuntu@"$host" 'sudo bash -s' << 'EOF'
+set -euo pipefail
+rsync -a --delete /tmp/isupipe-public/ /home/isucon/webapp/public/
+chown -R isucon:isucon /home/isucon/webapp/public
+systemctl disable --now isupipe-rust isupipe-go pdns || true
+install -m 0644 /tmp/isupipe.conf /etc/nginx/sites-enabled/isupipe.conf
+sed -i 's/worker_connections [0-9]\+/worker_connections 4096/' /etc/nginx/nginx.conf || true
+sed -i 's|^[ \t]*access_log .*|	access_log off;|' /etc/nginx/nginx.conf || true
+sed -i 's|^[ \t]*error_log .*|	error_log /dev/null emerg;|' /etc/nginx/nginx.conf || true
+: > /var/log/nginx/access.log || true
+: > /var/log/nginx/error.log || true
+nginx -t
+systemctl enable --now nginx
+systemctl reload nginx || systemctl restart nginx
+systemctl is-active nginx
+EOF
+}
+
+export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=skylake -C force-frame-pointers=yes}"
 echo "==== cargo musl release ===="
 (cd "$ROOT/webapp/rust" && cargo build --release --locked --target x86_64-unknown-linux-musl)
 BIN="$ROOT/webapp/rust/target/x86_64-unknown-linux-musl/release/isupipe"
@@ -57,7 +80,7 @@ ISUCON13_MYSQL_DIALCONFIG_PORT="3306"
 ISUCON13_MYSQL_DIALCONFIG_USER="isucon"
 ISUCON13_MYSQL_DIALCONFIG_DATABASE="isupipe"
 ISUCON13_MYSQL_DIALCONFIG_PARSETIME="true"
-ISUCON13_POWERDNS_SUBDOMAIN_ADDRESS="192.168.0.214"
+ISUCON13_POWERDNS_SUBDOMAIN_ADDRESS="192.168.0.214,192.168.0.216"
 ISUCON13_POWERDNS_DISABLED="true"
 ENV
 chown isucon:isucon /home/isucon/env.sh
@@ -70,21 +93,11 @@ systemctl restart isupipe-rust
 systemctl is-active isupipe-rust
 EOF
 
-echo "==== nginx edge 192.168.0.214 ===="
-"${RSYNC[@]}" "$ROOT/webapp/public/" ubuntu@192.168.0.214:/tmp/isupipe-public/
-scp -o BatchMode=yes "$ROOT/nginx/isupipe.conf" ubuntu@192.168.0.214:/tmp/isupipe.conf
-"${SSH[@]}" ubuntu@192.168.0.214 'sudo bash -s' << 'EOF'
-set -euo pipefail
-rsync -a --delete /tmp/isupipe-public/ /home/isucon/webapp/public/
-chown -R isucon:isucon /home/isucon/webapp/public
-systemctl disable --now isupipe-rust isupipe-go pdns mysql || true
-install -m 0644 /tmp/isupipe.conf /etc/nginx/sites-enabled/isupipe.conf
-sed -i 's/worker_connections [0-9]\+/worker_connections 4096/' /etc/nginx/nginx.conf || true
-nginx -t
-systemctl reload nginx
-systemctl is-active nginx
-EOF
+deploy_nginx 192.168.0.214
+"${SSH[@]}" ubuntu@192.168.0.214 'sudo systemctl disable --now mysql || true'
+deploy_nginx 192.168.0.216
 
 echo "cluster deploy done"
-echo "nameserver=.215  A=.214  mysql=.216  rust=.215:8080"
+echo "nameserver=.215  A=.214,.216  mysql=.216  rust=.215:8080"
+
 
