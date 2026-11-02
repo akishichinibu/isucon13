@@ -31,22 +31,32 @@ const (
 
 var fallbackImage = "../img/NoImage.jpg"
 
+// SHA256 of webapp/img/NoImage.jpg; used if the file is unreadable at runtime.
+const fallbackImageHashDefault = "d9f8294e9d895f81ce62e73dc7d5dff862a4fa40bd4e0fecf53f7526a8edcac0"
+
 var (
-	fallbackImageHash     string
 	fallbackImageHashOnce sync.Once
-	fallbackImageHashErr  error
+	fallbackImageHashVal  string
 )
 
-func getFallbackImageHash() (string, error) {
+func fallbackIconHash() string {
 	fallbackImageHashOnce.Do(func() {
 		image, err := os.ReadFile(fallbackImage)
 		if err != nil {
-			fallbackImageHashErr = err
+			fallbackImageHashVal = fallbackImageHashDefault
 			return
 		}
-		fallbackImageHash = fmt.Sprintf("%x", sha256.Sum256(image))
+		fallbackImageHashVal = fmt.Sprintf("%x", sha256.Sum256(image))
 	})
-	return fallbackImageHash, fallbackImageHashErr
+	return fallbackImageHashVal
+}
+
+func normalizeETag(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) >= 2 && (v[0] == 'W' || v[0] == 'w') && v[1] == '/' {
+		v = strings.TrimSpace(v[2:])
+	}
+	return strings.Trim(v, `"`)
 }
 
 type UserModel struct {
@@ -131,33 +141,45 @@ func getIconHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user: "+err.Error())
 	}
 
-	ifNoneMatch := strings.Trim(c.Request().Header.Get("If-None-Match"), `"`)
+	ifNoneMatch := c.Request().Header.Get("If-None-Match")
 	if ifNoneMatch != "" {
-		var iconHash string
-		err := tx.GetContext(ctx, &iconHash, "SELECT icon_hash FROM icons WHERE user_id = ?", user.ID)
-		if errors.Is(err, sql.ErrNoRows) {
-			iconHash, err = getFallbackImageHash()
-			if err != nil {
-				return echo.NewHTTPError(http.StatusInternalServerError, "failed to get fallback icon hash: "+err.Error())
+		var hash string
+		err := tx.GetContext(ctx, &hash, "SELECT icon_hash FROM icons WHERE user_id = ?", user.ID)
+		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user icon: "+err.Error())
 			}
-		} else if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user icon hash: "+err.Error())
+			hash = fallbackIconHash()
 		}
-		if ifNoneMatch == iconHash {
+		if normalizeETag(ifNoneMatch) == hash {
+			if err := tx.Commit(); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to commit: "+err.Error())
+			}
 			return c.NoContent(http.StatusNotModified)
 		}
 	}
 
-	var image []byte
-	if err := tx.GetContext(ctx, &image, "SELECT image FROM icons WHERE user_id = ?", user.ID); err != nil {
+	var icon struct {
+		Image    []byte `db:"image"`
+		IconHash string `db:"icon_hash"`
+	}
+	if err := tx.GetContext(ctx, &icon, "SELECT image, icon_hash FROM icons WHERE user_id = ?", user.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			if err := tx.Commit(); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to commit: "+err.Error())
+			}
+			c.Response().Header().Set("ETag", `"`+fallbackIconHash()+`"`)
 			return c.File(fallbackImage)
-		} else {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user icon: "+err.Error())
 		}
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user icon: "+err.Error())
 	}
 
-	return c.Blob(http.StatusOK, "image/jpeg", image)
+	if err := tx.Commit(); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to commit: "+err.Error())
+	}
+
+	c.Response().Header().Set("ETag", `"`+icon.IconHash+`"`)
+	return c.Blob(http.StatusOK, "image/jpeg", icon.Image)
 }
 
 func postIconHandler(c echo.Context) error {
@@ -449,16 +471,14 @@ func fillUserResponse(ctx context.Context, tx *sqlx.Tx, userModel UserModel) (Us
 		return User{}, err
 	}
 
-	var iconHash string
-	if err := tx.GetContext(ctx, &iconHash, "SELECT icon_hash FROM icons WHERE user_id = ?", userModel.ID); err != nil {
+	iconHash := fallbackIconHash()
+	var storedHash string
+	if err := tx.GetContext(ctx, &storedHash, "SELECT icon_hash FROM icons WHERE user_id = ?", userModel.ID); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return User{}, err
 		}
-		var errHash error
-		iconHash, errHash = getFallbackImageHash()
-		if errHash != nil {
-			return User{}, errHash
-		}
+	} else {
+		iconHash = storedHash
 	}
 
 	user := User{

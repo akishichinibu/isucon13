@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -102,14 +103,9 @@ func getLivecommentsHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livecomments: "+err.Error())
 	}
 
-	livecomments := make([]Livecomment, len(livecommentModels))
-	for i := range livecommentModels {
-		livecomment, err := fillLivecommentResponse(ctx, tx, livecommentModels[i])
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to fil livecomments: "+err.Error())
-		}
-
-		livecomments[i] = livecomment
+	livecomments, err := fillLivecommentsResponse(ctx, tx, livecommentModels)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fil livecomments: "+err.Error())
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -202,21 +198,8 @@ func postLivecommentHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get NG words: "+err.Error())
 	}
 
-	var hitSpam int
 	for _, ngword := range ngwords {
-		query := `
-		SELECT COUNT(*)
-		FROM
-		(SELECT ? AS text) AS texts
-		INNER JOIN
-		(SELECT CONCAT('%', ?, '%')	AS pattern) AS patterns
-		ON texts.text LIKE patterns.pattern;
-		`
-		if err := tx.GetContext(ctx, &hitSpam, query, req.Comment, ngword.Word); err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to get hitspam: "+err.Error())
-		}
-		c.Logger().Infof("[hitSpam=%d] comment = %s", hitSpam, req.Comment)
-		if hitSpam >= 1 {
+		if strings.Contains(req.Comment, ngword.Word) {
 			return echo.NewHTTPError(http.StatusBadRequest, "このコメントがスパム判定されました")
 		}
 	}
@@ -386,30 +369,31 @@ func moderateHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get NG words: "+err.Error())
 	}
 
-	// NGワードにヒットする過去の投稿も全削除する
-	for _, ngword := range ngwords {
-		// ライブコメント一覧取得
-		var livecomments []*LivecommentModel
-		if err := tx.SelectContext(ctx, &livecomments, "SELECT * FROM livecomments"); err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livecomments: "+err.Error())
-		}
+	// Delete past comments on this livestream that hit any NG word.
+	var livecomments []struct {
+		ID      int64  `db:"id"`
+		Comment string `db:"comment"`
+	}
+	if err := tx.SelectContext(ctx, &livecomments, "SELECT id, comment FROM livecomments WHERE livestream_id = ?", livestreamID); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livecomments: "+err.Error())
+	}
 
-		for _, livecomment := range livecomments {
-			query := `
-			DELETE FROM livecomments
-			WHERE
-			id = ? AND
-			livestream_id = ? AND
-			(SELECT COUNT(*)
-			FROM
-			(SELECT ? AS text) AS texts
-			INNER JOIN
-			(SELECT CONCAT('%', ?, '%')	AS pattern) AS patterns
-			ON texts.text LIKE patterns.pattern) >= 1;
-			`
-			if _, err := tx.ExecContext(ctx, query, livecomment.ID, livestreamID, livecomment.Comment, ngword.Word); err != nil {
-				return echo.NewHTTPError(http.StatusInternalServerError, "failed to delete old livecomments that hit spams: "+err.Error())
+	hitIDs := make([]int64, 0)
+	for _, livecomment := range livecomments {
+		for _, ngword := range ngwords {
+			if strings.Contains(livecomment.Comment, ngword.Word) {
+				hitIDs = append(hitIDs, livecomment.ID)
+				break
 			}
+		}
+	}
+	if len(hitIDs) > 0 {
+		query, args, err := sqlx.In("DELETE FROM livecomments WHERE id IN (?)", hitIDs)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to construct delete query: "+err.Error())
+		}
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to delete old livecomments that hit spams: "+err.Error())
 		}
 	}
 
@@ -423,60 +407,23 @@ func moderateHandler(c echo.Context) error {
 }
 
 func fillLivecommentResponse(ctx context.Context, tx *sqlx.Tx, livecommentModel LivecommentModel) (Livecomment, error) {
-	commentOwnerModel := UserModel{}
-	if err := tx.GetContext(ctx, &commentOwnerModel, "SELECT * FROM users WHERE id = ?", livecommentModel.UserID); err != nil {
-		return Livecomment{}, err
-	}
-	commentOwner, err := fillUserResponse(ctx, tx, commentOwnerModel)
+	livecomments, err := fillLivecommentsResponse(ctx, tx, []LivecommentModel{livecommentModel})
 	if err != nil {
 		return Livecomment{}, err
 	}
-
-	livestreamModel := LivestreamModel{}
-	if err := tx.GetContext(ctx, &livestreamModel, "SELECT * FROM livestreams WHERE id = ?", livecommentModel.LivestreamID); err != nil {
-		return Livecomment{}, err
+	if len(livecomments) != 1 {
+		return Livecomment{}, fmt.Errorf("failed to fill livecomment")
 	}
-	livestream, err := fillLivestreamResponse(ctx, tx, livestreamModel)
-	if err != nil {
-		return Livecomment{}, err
-	}
-
-	livecomment := Livecomment{
-		ID:         livecommentModel.ID,
-		User:       commentOwner,
-		Livestream: livestream,
-		Comment:    livecommentModel.Comment,
-		Tip:        livecommentModel.Tip,
-		CreatedAt:  livecommentModel.CreatedAt,
-	}
-
-	return livecomment, nil
+	return livecomments[0], nil
 }
 
 func fillLivecommentReportResponse(ctx context.Context, tx *sqlx.Tx, reportModel LivecommentReportModel) (LivecommentReport, error) {
-	reporterModel := UserModel{}
-	if err := tx.GetContext(ctx, &reporterModel, "SELECT * FROM users WHERE id = ?", reportModel.UserID); err != nil {
-		return LivecommentReport{}, err
-	}
-	reporter, err := fillUserResponse(ctx, tx, reporterModel)
+	reports, err := fillLivecommentReportsResponse(ctx, tx, []LivecommentReportModel{reportModel})
 	if err != nil {
 		return LivecommentReport{}, err
 	}
-
-	livecommentModel := LivecommentModel{}
-	if err := tx.GetContext(ctx, &livecommentModel, "SELECT * FROM livecomments WHERE id = ?", reportModel.LivecommentID); err != nil {
-		return LivecommentReport{}, err
+	if len(reports) != 1 {
+		return LivecommentReport{}, fmt.Errorf("failed to fill livecomment report")
 	}
-	livecomment, err := fillLivecommentResponse(ctx, tx, livecommentModel)
-	if err != nil {
-		return LivecommentReport{}, err
-	}
-
-	report := LivecommentReport{
-		ID:          reportModel.ID,
-		Reporter:    reporter,
-		Livecomment: livecomment,
-		CreatedAt:   reportModel.CreatedAt,
-	}
-	return report, nil
+	return reports[0], nil
 }
