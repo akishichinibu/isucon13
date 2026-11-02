@@ -111,6 +111,7 @@ func initializeHandler(c echo.Context) error {
 		c.Logger().Warnf("init.sh failed with err=%s", string(out))
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to initialize: "+err.Error())
 	}
+	resetPDNSDomainID()
 
 	c.Request().Header.Add("Content-Type", "application/json;charset=utf-8")
 	return c.JSON(http.StatusOK, InitializeResponse{
@@ -192,6 +193,14 @@ func main() {
 	}
 	defer conn.Close()
 	dbConn = conn
+
+	pdns, err := connectPDNS(e.Logger)
+	if err != nil {
+		e.Logger.Errorf("failed to connect PowerDNS db: %v", err)
+		os.Exit(1)
+	}
+	defer pdns.Close()
+	pdnsConn = pdns
 
 	subdomainAddr, ok := os.LookupEnv(powerDNSSubdomainAddressEnvKey)
 	if !ok {

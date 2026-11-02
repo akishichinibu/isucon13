@@ -29,6 +29,9 @@ rsync -a --delete /tmp/isupipe-sql/ /home/isucon/webapp/sql/
 rsync -a --delete /tmp/isupipe-pdns/ /home/isucon/webapp/pdns/
 rsync -a --delete /tmp/isupipe-img/ /home/isucon/webapp/img/
 chown -R isucon:isucon /home/isucon/webapp/go /home/isucon/webapp/sql /home/isucon/webapp/pdns /home/isucon/webapp/img
+if [ -f /home/isucon/webapp/pdns/pdns.conf ]; then
+  install -m 0644 /home/isucon/webapp/pdns/pdns.conf /etc/powerdns/pdns.conf
+fi
 if [ -f /tmp/mysqld-isucon.cnf ]; then
   install -m 0644 /tmp/mysqld-isucon.cnf /etc/mysql/mysql.conf.d/isucon.cnf
   systemctl restart mysql
@@ -40,6 +43,9 @@ fi
 if [ -f /tmp/isupipe-go.service ]; then
   install -m 0644 /tmp/isupipe-go.service /etc/systemd/system/isupipe-go.service
   systemctl daemon-reload
+fi
+if [ -f /home/isucon/webapp/pdns/pdns.conf ]; then
+  systemctl restart pdns
 fi
 sudo -u isucon bash -lc 'cd /home/isucon/webapp/go && /home/isucon/local/golang/bin/go build -mod=vendor -o isupipe -ldflags "-s -w"'
 systemctl restart isupipe-go
