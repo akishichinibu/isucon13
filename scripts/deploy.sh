@@ -49,6 +49,7 @@ if [ -f /home/isucon/webapp/pdns/pdns.conf ]; then
 fi
 sudo -u isucon bash -lc 'cd /home/isucon/webapp/go && /home/isucon/local/golang/bin/go build -mod=vendor -o isupipe -ldflags "-s -w"'
 systemctl restart isupipe-go
+systemctl reset-failed isupipe-go pdns || true
 systemctl is-active isupipe-go nginx mysql pdns
 EOF
 done

@@ -31,7 +31,6 @@ source initial_reservation_slots.sql
 source initial_reactions.sql
 source initial_ngwords.sql
 source initial_livecomments.sql
-source 11_schema_app.sql
 COMMIT;
 SET UNIQUE_CHECKS=1;
 SET FOREIGN_KEY_CHECKS=1;
