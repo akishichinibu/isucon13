@@ -13,61 +13,27 @@ ISUCON_DB_USER=${ISUCON13_MYSQL_DIALCONFIG_USER:-isucon}
 ISUCON_DB_PASSWORD=${ISUCON13_MYSQL_DIALCONFIG_PASSWORD:-isucon}
 ISUCON_DB_NAME=${ISUCON13_MYSQL_DIALCONFIG_DATABASE:-isupipe}
 
-# MySQLを初期化
+# Recreate schema and load dumps in one session. unique_checks/fk checks off
+# keeps bulk INSERT fast even with the extra secondary indexes.
 mysql -u"$ISUCON_DB_USER" \
 		-p"$ISUCON_DB_PASSWORD" \
 		--host "$ISUCON_DB_HOST" \
 		--port "$ISUCON_DB_PORT" \
-		"$ISUCON_DB_NAME" < init.sql
+		--default-character-set=utf8mb4 \
+		"$ISUCON_DB_NAME" <<EOF
+source init.sql
+source initdb.d/10_schema.sql
+source initial_users.sql
+source initial_livestreams.sql
+source initial_tags.sql
+source initial_livestream_tags.sql
+source initial_reservation_slots.sql
+source initial_reactions.sql
+source initial_ngwords.sql
+source initial_livecomments.sql
+COMMIT;
+SET UNIQUE_CHECKS=1;
+SET FOREIGN_KEY_CHECKS=1;
+EOF
 
-mysql -u"$ISUCON_DB_USER" \
-		-p"$ISUCON_DB_PASSWORD" \
-		--host "$ISUCON_DB_HOST" \
-		--port "$ISUCON_DB_PORT" \
-		"$ISUCON_DB_NAME" < initial_users.sql
-
-mysql -u"$ISUCON_DB_USER" \
-		-p"$ISUCON_DB_PASSWORD" \
-		--host "$ISUCON_DB_HOST" \
-		--port "$ISUCON_DB_PORT" \
-		"$ISUCON_DB_NAME" < initial_livestreams.sql
-
-mysql -u"$ISUCON_DB_USER" \
-		-p"$ISUCON_DB_PASSWORD" \
-		--host "$ISUCON_DB_HOST" \
-		--port "$ISUCON_DB_PORT" \
-		"$ISUCON_DB_NAME" < initial_tags.sql
-
-mysql -u"$ISUCON_DB_USER" \
-		-p"$ISUCON_DB_PASSWORD" \
-		--host "$ISUCON_DB_HOST" \
-		--port "$ISUCON_DB_PORT" \
-		"$ISUCON_DB_NAME" < initial_livestream_tags.sql
-
-mysql -u"$ISUCON_DB_USER" \
-		-p"$ISUCON_DB_PASSWORD" \
-		--host "$ISUCON_DB_HOST" \
-		--port "$ISUCON_DB_PORT" \
-		"$ISUCON_DB_NAME" < initial_reservation_slots.sql
-
-mysql -u"$ISUCON_DB_USER" \
-		-p"$ISUCON_DB_PASSWORD" \
-		--host "$ISUCON_DB_HOST" \
-		--port "$ISUCON_DB_PORT" \
-		"$ISUCON_DB_NAME" < initial_reactions.sql
-
-mysql -u"$ISUCON_DB_USER" \
-		-p"$ISUCON_DB_PASSWORD" \
-		--host "$ISUCON_DB_HOST" \
-		--port "$ISUCON_DB_PORT" \
-		"$ISUCON_DB_NAME" < initial_ngwords.sql
-
-mysql -u"$ISUCON_DB_USER" \
-		-p"$ISUCON_DB_PASSWORD" \
-		--host "$ISUCON_DB_HOST" \
-		--port "$ISUCON_DB_PORT" \
-		"$ISUCON_DB_NAME" < initial_livecomments.sql
-
-bash ../pdns/init_zone.sh 
-
-
+bash ../pdns/init_zone.sh
